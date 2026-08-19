@@ -1,10 +1,28 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Environments / build
+.venv/
 build/
 dist/
 wheels/
-*.egg-info
 
-# Virtual environments
-.venv
+# Runtime outputs
+outputs/*
+!outputs/.gitkeep
+sana_received/
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

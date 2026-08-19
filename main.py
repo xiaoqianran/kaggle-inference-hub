@@ -1,6 +1,3 @@
-def main():
-    print("Hello from 001-sana-sprint-1-6b!")
+from recv import app
 
-
-if __name__ == "__main__":
-    main()
+__all__ = ["app"]
