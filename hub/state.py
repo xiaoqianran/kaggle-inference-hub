@@ -78,6 +78,11 @@ class HubState:
             lease = self.inflight.get(task_id)
             return lease.worker_id if lease else None
 
+    def lease_task(self, task_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            lease = self.inflight.get(task_id)
+            return dict(lease.task) if lease else None
+
     def complete(self, task_id: int) -> None:
         with self.lock:
             self.inflight.pop(task_id, None)

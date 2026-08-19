@@ -1,6 +1,6 @@
 [project]
 name = "kaggle-inference-hub"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local control plane for model-specific Kaggle GPU inference workers"
 readme = "README.md"
 requires-python = ">=3.12"

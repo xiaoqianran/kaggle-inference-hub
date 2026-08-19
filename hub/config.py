@@ -47,6 +47,23 @@ WORKER_TTL_SECONDS = int(os.getenv("KAGGLE_HUB_WORKER_TTL_SECONDS", "45"))
 HISTORY_LIMIT = int(os.getenv("KAGGLE_HUB_HISTORY_LIMIT", "500"))
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+PROMPT_AI_ENABLED = env_bool("PROMPT_AI_ENABLED", False)
+PROMPT_AI_BASE_URL = os.getenv("PROMPT_AI_BASE_URL", "").strip()
+PROMPT_AI_API_KEY = os.getenv("PROMPT_AI_API_KEY", "").strip()
+PROMPT_AI_MODEL = os.getenv("PROMPT_AI_MODEL", "").strip()
+PROMPT_AI_TIMEOUT_SECONDS = float(os.getenv("PROMPT_AI_TIMEOUT_SECONDS", "60"))
+PROMPT_AI_CONCURRENCY = max(1, int(os.getenv("PROMPT_AI_CONCURRENCY", "4")))
+PROMPT_AI_MAX_TOKENS = max(64, int(os.getenv("PROMPT_AI_MAX_TOKENS", "900")))
+PROMPT_AI_TEMPERATURE = float(os.getenv("PROMPT_AI_TEMPERATURE", "0.35"))
+
+
 def canonical_model(value: str | None) -> str:
     value = (value or DEFAULT_MODEL).strip().lower()
     value = MODEL_ALIASES.get(value, value)

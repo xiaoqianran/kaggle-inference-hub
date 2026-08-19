@@ -1,6 +1,6 @@
 # Kaggle Inference Hub
 
-把 Kaggle 双 T4 Notebook 作为可远程调度的 GPU Worker。本地 FastAPI 只负责 Prompt、模型路由、队列、Worker 状态和生成结果；模型推理留在 Kaggle。
+把 Kaggle 双 T4 Notebook 作为可远程调度的 GPU Worker。本地 FastAPI 负责 Prompt、可选 AI Prompt Pipeline、模型路由、队列、Worker 状态和生成结果；模型推理留在 Kaggle。
 
 当前内置两种 Worker：
 
@@ -14,6 +14,10 @@ Browser / Local API
         │
         ▼
 Kaggle Inference Hub (FastAPI)
+        │
+        ├── AI Prompt Pipeline ─────► OpenAI-compatible API
+        │         │
+        │         └── 优化结果先回填 UI，由用户确认后再提交
         │
         ├── queue: sana-sprint-1.6b ─────► Kaggle SANA Worker (2×T4)
         │
@@ -74,11 +78,49 @@ UI 中先选择模型，然后提交 Prompt。单 Prompt 输入框支持任意�
 
 页面同时展示模型队列、inflight 数量、在线 Worker 和统一图片 Gallery。
 
+## AI Prompt Pipeline
+
+Pipeline 完全运行在本地 Hub 控制面，**不会改 Kaggle Notebook**。流程：
+
+```text
+原始 Prompt
+    │
+    ▼
+AI Prompt Pipeline
+    ├── enhance   增强
+    ├── creative  创意扩写
+    ├── translate 忠实英译
+    └── clean     整理
+    │
+    ├── SANA adapter
+    └── Z-Image adapter
+    │
+    ▼
+回填输入框 → 用户确认 → /task → Kaggle Worker
+```
+
+默认关闭。配置任意 OpenAI-compatible `/v1` 接口：
+
+```env
+PROMPT_AI_ENABLED=true
+PROMPT_AI_BASE_URL=https://api.openai.com/v1
+PROMPT_AI_API_KEY=your-key
+PROMPT_AI_MODEL=your-model
+PROMPT_AI_CONCURRENCY=4
+```
+
+`PROMPT_AI_API_KEY` 可以留空，方便连接不需要鉴权的本地 OpenAI-compatible 服务。批量 AI 优化最多一次处理 200 条，实际并发由 `PROMPT_AI_CONCURRENCY` 限制。
+
+AI 优化后的 Prompt 不会自动发送到 GPU。UI 会保存原始 Prompt；生成完成后 Gallery 可以展开查看 AI 前原文。若 AI 后又手工编辑，或优化后切换了目标模型，这些状态也会写入任务的 Prompt 元数据。
+
 ## API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/models` | 模型清单 |
+| `GET` | `/api/prompt/pipeline` | AI Pipeline 状态 / 模式 |
+| `POST` | `/api/prompt/process` | 单条 Prompt AI 处理 |
+| `POST` | `/api/prompt/process/batch` | 批量 Prompt AI 处理 |
 | `POST` | `/task` | 单任务入队 |
 | `POST` | `/task/batch` | 批量入队 |
 | `GET` | `/task/next?model=...&worker_id=...` | Worker 长轮询领取指定模型任务 |

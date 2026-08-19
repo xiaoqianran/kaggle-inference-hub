@@ -9,6 +9,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from hub.config import canonical_model
 from hub.crypto import decrypt_blob
+from hub.prompt_pipeline.pipeline import PromptPipeline
+from hub.prompt_pipeline.prompts import build_system_prompt
 from hub.state import HubState
 
 
@@ -29,7 +31,12 @@ def main():
     encrypted = nonce + AESGCM(key).encrypt(nonce, plain, None)
     assert decrypt_blob(encrypted, password) == plain
 
-    print("OK: model routing + queue isolation + AES-GCM protocol")
+    system_prompt = build_system_prompt("sana-sprint-1.6b", "enhance", True)
+    assert "SANA Sprint 1.6B" in system_prompt
+    assert "Return the final prompt in English" in system_prompt
+    assert PromptPipeline._clean_output('Prompt: "a red cube"') == "a red cube"
+
+    print("OK: model routing + queue isolation + AES-GCM + prompt pipeline")
 
 
 if __name__ == "__main__":
