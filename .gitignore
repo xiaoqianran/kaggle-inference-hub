@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Environments / build
+.venv/
+build/
+dist/
+wheels/
+
+# Runtime outputs
+outputs/*
+!outputs/.gitkeep
+sana_received/
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
