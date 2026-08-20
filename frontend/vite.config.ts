@@ -14,6 +14,8 @@ export default defineConfig({
   build: {
     outDir: '../hub/web',
     emptyOutDir: true,
+    // The GLB viewer is an intentional lazy boundary; keep its chunk budget tight.
+    chunkSizeWarningLimit: 650,
   },
   server: {
     port: 5173,

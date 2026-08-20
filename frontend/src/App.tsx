@@ -1,20 +1,36 @@
 import { useQuery } from '@tanstack/react-query'
 import { AlertCircle } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Gallery } from '@/features/gallery/gallery'
-import { GenerationPanel } from '@/features/generation/generation-panel'
-import { ControlCenterSheet } from '@/features/status/control-center-sheet'
 import { ModelTopbar } from '@/features/status/model-topbar'
 import { WorkspaceHeader, type WorkspaceKind } from '@/features/status/workspace-header'
-import { TripoPanel } from '@/features/triposr/triposr-panel'
-import { VideoWorkspace } from '@/features/video/video-workspace'
 import { useHubSocket } from '@/hooks/use-hub-socket'
 import { historyQuery, modelsQuery, promptPipelineQuery, statusQuery } from '@/shared/api/queries'
 import type { TripoSettings } from '@/shared/api/types'
 
 const DEFAULT_MODEL = 'sana-sprint-1.6b'
+const GenerationPanel = lazy(async () => {
+  const module = await import('@/features/generation/generation-panel')
+  return { default: module.GenerationPanel }
+})
+const ControlCenterSheet = lazy(async () => {
+  const module = await import('@/features/status/control-center-sheet')
+  return { default: module.ControlCenterSheet }
+})
+const TripoPanel = lazy(async () => {
+  const module = await import('@/features/triposr/triposr-panel')
+  return { default: module.TripoPanel }
+})
+const VideoWorkspace = lazy(async () => {
+  const module = await import('@/features/video/video-workspace')
+  return { default: module.VideoWorkspace }
+})
+
+function WorkspaceFallback({ className = 'min-h-52' }: { className?: string }) {
+  return <div className={`animate-pulse rounded-xl bg-[var(--ctp-mantle)]/60 ${className}`} aria-hidden="true" />
+}
 
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('kaggle_hub_token') ?? '')
@@ -89,15 +105,17 @@ export default function App() {
       ) : null}
 
       <main className="mx-auto grid w-full max-w-[1880px] grid-cols-1 gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[360px_minmax(0,1fr)] lg:px-8 lg:py-8">
-        {currentModel ? (
+        {workspace === 'image' && currentModel ? (
           <aside className={workspace === 'image' ? 'lg:sticky lg:top-20 lg:self-start' : 'hidden'}>
-            <GenerationPanel
-              model={currentModel}
-              pipeline={pipeline.data}
-              status={status.data}
-              token={token}
-              modelResultCount={resultCounts[currentModel.id] ?? 0}
-            />
+            <Suspense fallback={<WorkspaceFallback />}>
+              <GenerationPanel
+                model={currentModel}
+                pipeline={pipeline.data}
+                status={status.data}
+                token={token}
+                modelResultCount={resultCounts[currentModel.id] ?? 0}
+              />
+            </Suspense>
           </aside>
         ) : null}
 
@@ -115,9 +133,13 @@ export default function App() {
             />
         ) : null}
 
-        <aside className={workspace === '3d' ? 'lg:sticky lg:top-20 lg:self-start' : 'hidden'}>
-          <TripoPanel token={token} settings={tripoSettings} onSettingsChange={setTripoSettings} status={status.data} />
-        </aside>
+        {workspace === '3d' ? (
+          <aside className="lg:sticky lg:top-20 lg:self-start">
+            <Suspense fallback={<WorkspaceFallback />}>
+              <TripoPanel token={token} settings={tripoSettings} onSettingsChange={setTripoSettings} status={status.data} />
+            </Suspense>
+          </aside>
+        ) : null}
 
         {workspace === '3d' ? (
             <Gallery
@@ -133,17 +155,25 @@ export default function App() {
             />
         ) : null}
 
-        {workspace === 'video' ? <VideoWorkspace /> : null}
+        {workspace === 'video' ? (
+          <Suspense fallback={<WorkspaceFallback className="col-span-full min-h-96" />}>
+            <VideoWorkspace />
+          </Suspense>
+        ) : null}
       </main>
 
-      <ControlCenterSheet
-        open={controlCenterOpen}
-        onOpenChange={setControlCenterOpen}
-        token={token}
-        onTokenChange={setToken}
-        status={status.data}
-        models={models.data ?? []}
-      />
+      {controlCenterOpen ? (
+        <Suspense fallback={null}>
+          <ControlCenterSheet
+            open
+            onOpenChange={setControlCenterOpen}
+            token={token}
+            onTokenChange={setToken}
+            status={status.data}
+            models={models.data ?? []}
+          />
+        </Suspense>
+      ) : null}
     </div>
   )
 }

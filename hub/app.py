@@ -42,8 +42,9 @@ WEB_DIR = Path(__file__).with_name("web")
 @app.middleware("http")
 async def hub_response_headers(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith("/assets/"):
-        # Vite fingerprints assets, so they are safe to cache indefinitely.
+    if request.url.path.startswith(("/assets/", "/images/", "/outputs/")):
+        # Fingerprinted frontend and completed output files are immutable.
+        # Long-lived caching keeps repeated previews/downloads off the Hub.
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     else:
         # Worker polling and diagnostics must never be cached by a tunnel/CDN.
