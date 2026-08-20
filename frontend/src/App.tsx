@@ -103,6 +103,7 @@ export default function App() {
 
         {workspace === 'image' && currentModel ? (
             <Gallery
+              key={currentModel.id}
               workspace="image"
               items={imageItems}
               model={currentModel}
@@ -120,6 +121,7 @@ export default function App() {
 
         {workspace === '3d' ? (
             <Gallery
+              key="artifacts"
               workspace="3d"
               items={artifactItems}
               model={tripoModel}
