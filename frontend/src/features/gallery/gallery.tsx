@@ -1,4 +1,5 @@
-import { Box, ImageIcon, RefreshCw } from 'lucide-react'
+import { Box, ChevronLeft, ChevronRight, ImageIcon, RefreshCw } from 'lucide-react'
+import { useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -18,6 +19,18 @@ type GalleryProps = {
   onRefresh: () => void
 }
 
+const PAGE_SIZE = 12
+type PageItem = number | 'ellipsis-left' | 'ellipsis-right'
+
+function getPageItems(currentPage: number, pageCount: number): PageItem[] {
+  if (pageCount <= 7) return Array.from({ length: pageCount }, (_, index) => index + 1)
+  if (currentPage <= 4) return [1, 2, 3, 4, 5, 'ellipsis-right', pageCount]
+  if (currentPage >= pageCount - 3) {
+    return [1, 'ellipsis-left', pageCount - 4, pageCount - 3, pageCount - 2, pageCount - 1, pageCount]
+  }
+  return [1, 'ellipsis-left', currentPage - 1, currentPage, currentPage + 1, 'ellipsis-right', pageCount]
+}
+
 export function Gallery({
   workspace,
   items,
@@ -30,8 +43,12 @@ export function Gallery({
 }: GalleryProps) {
   const submitTripo = useSubmitTripo(token)
   const newestFirst = items.toReversed()
+  const pageCount = Math.max(1, Math.ceil(newestFirst.length / PAGE_SIZE))
+  const [currentPage, setCurrentPage] = useState(1)
   const isImage = workspace === 'image'
   const GalleryIcon = isImage ? ImageIcon : Box
+  const activePage = Math.min(currentPage, pageCount)
+  const visibleItems = newestFirst.slice((activePage - 1) * PAGE_SIZE, activePage * PAGE_SIZE)
 
   return (
     <section className="min-w-0">
@@ -58,7 +75,7 @@ export function Gallery({
         </div>
       ) : newestFirst.length ? (
         <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-          {newestFirst.map((item) => (
+          {visibleItems.map((item) => (
             <ResultCard
               key={item.event_id}
               item={item}
@@ -87,6 +104,55 @@ export function Gallery({
           </p>
         </div>
       )}
+
+      {!isLoading && newestFirst.length > 0 && pageCount > 1 ? (
+        <nav className="mt-6 flex flex-wrap items-center justify-between gap-3" aria-label="图库分页">
+          <p className="font-mono text-[10px] text-muted-foreground">
+            第 {activePage} / {pageCount} 页 · 共 {items.length} 项
+          </p>
+          <div className="flex items-center gap-1">
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-sm"
+              aria-label="上一页"
+              onClick={() => setCurrentPage((page) => Math.max(1, page - 1))}
+              disabled={activePage === 1}
+            >
+              <ChevronLeft />
+            </Button>
+            {getPageItems(activePage, pageCount).map((page) =>
+              typeof page === 'number' ? (
+                <Button
+                  key={page}
+                  type="button"
+                  variant={page === activePage ? 'default' : 'outline'}
+                  size="icon-sm"
+                  aria-label={`第 ${page} 页`}
+                  aria-current={page === activePage ? 'page' : undefined}
+                  onClick={() => setCurrentPage(page)}
+                >
+                  {page}
+                </Button>
+              ) : (
+                <span key={page} className="flex size-6 items-center justify-center text-xs text-muted-foreground" aria-hidden="true">
+                  …
+                </span>
+              ),
+            )}
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-sm"
+              aria-label="下一页"
+              onClick={() => setCurrentPage((page) => Math.min(pageCount, page + 1))}
+              disabled={activePage === pageCount}
+            >
+              <ChevronRight />
+            </Button>
+          </div>
+        </nav>
+      ) : null}
     </section>
   )
 }
