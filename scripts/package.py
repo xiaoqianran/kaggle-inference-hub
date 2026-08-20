@@ -22,6 +22,7 @@ EXCLUDED_DIRS = {
     ".ruff_cache",
     "build",
     "dist",
+    "node_modules",
     "wheels",
     "outputs",
     "sana_received",

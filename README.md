@@ -38,13 +38,35 @@ outputs/<model>/ + Live Gallery
 
 ## 本地启动
 
+仓库已经包含前端构建产物 `hub/web/`，所以日常直接启动只需要：
+
 ```powershell
 uv sync
 $env:KAGGLE_HUB_TOKEN="wangran"
-uv run python recv.py
+uv run recv.py
 ```
 
-打开：<http://127.0.0.1:30100>
+然后打开：<http://127.0.0.1:30100>。`FastAPI` 会自动读取 `hub/web/index.html` 和其中的静态资源，不需要启动 Node.js。
+
+只有在修改了 `frontend/` 源码后，才需要重新构建：
+
+```powershell
+pnpm --dir frontend install
+pnpm --dir frontend build
+uv run recv.py
+```
+
+日常前端开发使用两个终端。Vite 提供热更新，并把 REST、WebSocket、图片和产物路径代理到 FastAPI：
+
+```powershell
+# Terminal 1
+uv run uvicorn recv:app --host 127.0.0.1 --port 30100 --reload
+
+# Terminal 2
+pnpm --dir frontend dev
+```
+
+开发页面：<http://127.0.0.1:5173>。生产构建输出到 `hub/web/`，运行时不需要 Node.js。
 
 也可以：
 
@@ -60,9 +82,10 @@ uv run uvicorn recv:app --host 0.0.0.0 --port 30100 --workers 4
 
 ## 打包源码
 
-不要直接使用资源管理器的“压缩为 ZIP”，因为它不会读取 `.gitignore`。使用下面的命令会生成 `dist/kaggle-image-inference-hub.zip`，自动排除 `.venv/`、`.git/`、缓存、`outputs/`、`sana_received/` 和本地配置：
+不要直接使用资源管理器的“压缩为 ZIP”，因为它不会读取 `.gitignore`。先构建前端，再生成 ZIP；脚本会自动排除 `.venv/`、`node_modules/`、`.git/`、缓存、`outputs/`、`sana_received/` 和本地配置：
 
 ```powershell
+pnpm --dir frontend build
 uv run python scripts/package.py
 ```
 
@@ -111,6 +134,10 @@ curl.exe -X POST http://127.0.0.1:30100/task/triposr `
 ```
 
 ## 本地 UI
+
+前端采用 Vite + React + TypeScript + shadcn/ui + Tailwind CSS，视觉主题为 Catppuccin Frappé。TanStack Query 管理 Hub 服务端状态，React Hook Form + Zod 管理生成参数，WebSocket 事件直接更新 Query Cache，并保留定时同步兜底。FastAPI 继续作为唯一生产服务端。
+
+界面按两级导航组织：高 Header 切换图片、3D、视频工作区；其下 Topbar 切换当前工作区的模型。图片 Gallery 按模型隔离展示，3D 上传与资产库只在 3D 工作区出现；Access Token、Worker 和 Hub 诊断信息集中在右上角控制中心。
 
 UI 中先选择模型，然后提交 Prompt。单 Prompt 输入框支持任意换行；批量输入框才采用“一行一个任务”。切换模型时 Steps 自动切换到模型默认值：
 
@@ -181,11 +208,14 @@ AI 优化后的 Prompt 不会自动发送到 GPU。UI 会保存原始 Prompt；�
 
 ## 兼容性
 
-旧 SANA 客户端如果仍然请求 `/task/next` 且不带 `model`，服务端默认路由到 `sana-sprint-1.6b`。旧 `/task`、`/task/batch`、`/upload` 也保留默认 SANA 行为，因此可以逐步迁移。所有 HTTP 响应均带 `Cache-Control: no-store` 和稳定的 `X-Hub-Instance`，便于识别 Tunnel 是否错误地连接到不同 Hub 数据库。
+旧 SANA 客户端如果仍然请求 `/task/next` 且不带 `model`，服务端默认路由到 `sana-sprint-1.6b`。旧 `/task`、`/task/batch`、`/upload` 也保留默认 SANA 行为，因此可以逐步迁移。动态 HTTP 响应均带 `Cache-Control: no-store` 和稳定的 `X-Hub-Instance`，便于识别 Tunnel 是否错误地连接到不同 Hub 数据库；带内容哈希的前端 `/assets/` 使用长期缓存。
 
 ## 自检
 
 ```powershell
+pnpm --dir frontend typecheck
+pnpm --dir frontend lint
+pnpm --dir frontend build
 uv run python -m compileall -q recv.py hub scripts
 uv run python scripts/self_test.py
 ```
