@@ -132,12 +132,16 @@ class HubState:
             for lease in self.inflight.values():
                 inflight_by_model[lease.task["model"]] += 1
             queued_by_model = {m: q.qsize() for m, q in self.queues.items()}
+            images = sum(1 for item in self.history if item.get("kind", "image") == "image")
+            artifacts = sum(1 for item in self.history if item.get("kind") == "artifact")
             return {
                 "queued": sum(queued_by_model.values()),
                 "queued_by_model": queued_by_model,
                 "inflight": len(self.inflight),
                 "inflight_by_model": inflight_by_model,
-                "images": len(self.history),
+                "results": len(self.history),
+                "images": images,
+                "artifacts": artifacts,
                 "failed": len(self.failed),
                 "workers": workers,
             }

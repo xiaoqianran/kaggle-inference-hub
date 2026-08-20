@@ -11,6 +11,8 @@ class ModelSpec:
     label: str
     default_steps: int
     description: str
+    input_kind: str = "prompt"
+    output_kind: str = "image"
 
 
 MODEL_SPECS = {
@@ -26,6 +28,14 @@ MODEL_SPECS = {
         default_steps=8,
         description="stable-diffusion.cpp · Q4_K · T4 sm_75",
     ),
+    "triposr": ModelSpec(
+        id="triposr",
+        label="TripoSR",
+        default_steps=0,
+        description="single image to GLB/OBJ · dual T4 worker",
+        input_kind="image",
+        output_kind="artifact",
+    ),
 }
 
 MODEL_ALIASES = {
@@ -34,6 +44,8 @@ MODEL_ALIASES = {
     "z-image": "z-image-turbo-gguf",
     "zimage": "z-image-turbo-gguf",
     "z-image-turbo": "z-image-turbo-gguf",
+    "tripo": "triposr",
+    "tripo-sr": "triposr",
 }
 
 DEFAULT_MODEL = "sana-sprint-1.6b"
@@ -45,6 +57,8 @@ MAX_ATTEMPTS = int(os.getenv("KAGGLE_HUB_MAX_ATTEMPTS", "3"))
 QUEUE_SIZE = int(os.getenv("KAGGLE_HUB_QUEUE_SIZE", "1000"))
 WORKER_TTL_SECONDS = int(os.getenv("KAGGLE_HUB_WORKER_TTL_SECONDS", "45"))
 HISTORY_LIMIT = int(os.getenv("KAGGLE_HUB_HISTORY_LIMIT", "500"))
+INPUT_MAX_BYTES = int(os.getenv("KAGGLE_HUB_INPUT_MAX_MB", "20")) * 1024 * 1024
+ARTIFACT_MAX_BYTES = int(os.getenv("KAGGLE_HUB_ARTIFACT_MAX_MB", "100")) * 1024 * 1024
 
 
 def env_bool(name: str, default: bool = False) -> bool:
