@@ -52,6 +52,7 @@ DEFAULT_MODEL = "sana-sprint-1.6b"
 TOKEN = os.getenv("KAGGLE_HUB_TOKEN", os.getenv("PASSWORD", "wangran"))
 PORT = int(os.getenv("KAGGLE_HUB_PORT", "30100"))
 OUTPUT_DIR = Path(os.getenv("KAGGLE_HUB_OUTPUT_DIR", "outputs"))
+STATE_DB = Path(os.getenv("KAGGLE_HUB_STATE_DB", str(OUTPUT_DIR / "hub-state.sqlite3")))
 LEASE_SECONDS = int(os.getenv("KAGGLE_HUB_LEASE_SECONDS", "1200"))
 MAX_ATTEMPTS = int(os.getenv("KAGGLE_HUB_MAX_ATTEMPTS", "3"))
 QUEUE_SIZE = int(os.getenv("KAGGLE_HUB_QUEUE_SIZE", "1000"))

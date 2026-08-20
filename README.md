@@ -16,6 +16,8 @@ Browser / Local API
         ▼
 Kaggle Inference Hub (FastAPI)
         │
+        ├── SQLite durable state ── tasks / leases / workers / history
+        │
         ├── AI Prompt Pipeline ─────► OpenAI-compatible API
         │         │
         │         └── 优化结果先回填 UI，由用户确认后再提交
@@ -32,7 +34,7 @@ Kaggle Inference Hub (FastAPI)
 outputs/<model>/ + Live Gallery
 ```
 
-三个模型共享本地控制面，但**任务队列按模型隔离**，不同 Notebook 不会互相抢任务。
+三个模型共享本地控制面，但**任务队列按模型隔离**，不同 Notebook 不会互相抢任务。任务、租约、Worker 和历史状态持久化到 `outputs/hub-state.sqlite3`；多个 Uvicorn 进程共享同一状态，Hub 重启后未完成任务仍然存在。
 
 ## 本地启动
 
@@ -48,6 +50,12 @@ uv run python recv.py
 
 ```powershell
 uv run uvicorn recv:app --host 0.0.0.0 --port 30100 --reload
+```
+
+也支持多进程：
+
+```powershell
+uv run uvicorn recv:app --host 0.0.0.0 --port 30100 --workers 4
 ```
 
 ## 打包源码
@@ -81,15 +89,15 @@ cloudflared tunnel --url http://localhost:30100
 所有 Notebook 都会：
 
 1. 注册自己的 `worker_id + model`。
-2. 对对应模型执行 25 秒 long polling。
+2. 对对应模型执行 25 秒 long polling；003 使用不可缓存的 `POST /task/claim`，001/002 的旧 `GET /task/next` 继续兼容。
 3. 双 GPU 并行处理。
 4. 将 WebP 或 3D 文件通过 AES-GCM 加密上传。
-5. 周期性发送心跳。
+5. 周期性发送心跳；003 同时续租正在推理的任务。
 6. 失败时通知本地服务进行有限次数重试。
 
 TripoSR 的 003 Notebook 采用专门的常驻架构：Notebook 内核仍可为 Python 3.12，但通过 Kaggle 自带 `uv` 创建 `/kaggle/working/TripoSR/.venv`（Python 3.10）。Notebook 只负责写入并启动 `kaggle_worker.py`；真正的 TripoSR、PyTorch、rembg 都只在这个 Python 3.10 进程体系中运行。父进程先缓存模型，然后为 GPU0/GPU1 各启动一个独立 Worker 进程，因此模型初始化只发生一次。
 
-TripoSR Notebook 需要在 Kaggle 启用 **GPU T4 x2** 与 **Internet**。推荐在 Add-ons → Secrets 中添加 `BASE_URL` 和 `KAGGLE_HUB_TOKEN`。本地 UI 可以直接上传 PNG/JPEG/WebP，也可以在 SANA、Z-Image 或其他接入 Hub 的生成图卡片上点击“转为 3D”。默认输出带顶点色的 GLB，也可选择 OBJ。
+TripoSR Notebook 需要在 Kaggle 启用 **GPU T4 x2** 与 **Internet**。当前 003 明确固定 Hub 为 `https://ranran-sana.202820.xyz`，Token 为 `wangran`；如需迁移，在启动 Cell 中同步修改这两项。本地 UI 可以直接上传 PNG/JPEG/WebP，也可以在 SANA、Z-Image 或其他接入 Hub 的生成图卡片上点击“转为 3D”。默认输出带顶点色的 GLB，也可选择 OBJ。
 
 TripoSR Runtime 固定为 PyTorch `2.7.1+cu128`，`torchmcubes` 直接从 `xiaoqianran/kaggle-build` 的 `triposr-py310-torch2.7.1-cu128-sm75` Release 安装预编译 wheel，不再在 Kaggle 上执行 CMake/NVCC。`rembg[gpu]` 使用 `onnxruntime-gpu`，并将两个 ONNX Session 分别绑定到 `device_id=0/1`；默认 `u2net`，如更重视速度可在启动 Cell 改为 `u2netp`。
 
@@ -157,6 +165,7 @@ AI 优化后的 Prompt 不会自动发送到 GPU。UI 会保存原始 Prompt；�
 | `POST` | `/task` | 单任务入队 |
 | `POST` | `/task/batch` | 批量入队 |
 | `POST` | `/task/triposr` | 上传或引用图片，加入 TripoSR 队列 |
+| `POST` | `/task/claim` | 新 Worker 不可缓存的原子长轮询领取接口 |
 | `GET` | `/task/next?model=...&worker_id=...` | Worker 长轮询领取指定模型任务 |
 | `GET` | `/task/input/{id}` | TripoSR Worker 鉴权下载输入图片 |
 | `POST` | `/task/fail` | Worker 报告失败并按策略回队列 |
@@ -172,7 +181,7 @@ AI 优化后的 Prompt 不会自动发送到 GPU。UI 会保存原始 Prompt；�
 
 ## 兼容性
 
-旧 SANA 客户端如果仍然请求 `/task/next` 且不带 `model`，服务端默认路由到 `sana-sprint-1.6b`。旧 `/task`、`/task/batch`、`/upload` 也保留默认 SANA 行为，因此可以逐步迁移。
+旧 SANA 客户端如果仍然请求 `/task/next` 且不带 `model`，服务端默认路由到 `sana-sprint-1.6b`。旧 `/task`、`/task/batch`、`/upload` 也保留默认 SANA 行为，因此可以逐步迁移。所有 HTTP 响应均带 `Cache-Control: no-store` 和稳定的 `X-Hub-Instance`，便于识别 Tunnel 是否错误地连接到不同 Hub 数据库。
 
 ## 自检
 

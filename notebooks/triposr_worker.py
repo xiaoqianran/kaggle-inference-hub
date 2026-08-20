@@ -29,6 +29,7 @@ REMBG_MODEL = os.getenv("TRIPOSR_REMBG_MODEL", "u2net")
 POLL_TIMEOUT = 35
 REQUEST_TIMEOUT = 120
 HEARTBEAT_SECONDS = 10
+IDLE_DIAGNOSTIC_SECONDS = 60
 
 
 def encrypt_blob(data: bytes) -> bytes:
@@ -42,7 +43,57 @@ def api_url(path: str) -> str:
 
 
 def auth_headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {TOKEN}"}
+    return {
+        "Authorization": f"Bearer {TOKEN}",
+        "Cache-Control": "no-cache, no-store",
+        "Pragma": "no-cache",
+    }
+
+
+def checked_response(response: requests.Response, label: str) -> requests.Response:
+    if response.status_code >= 400:
+        body = response.text[:1000].replace("\n", " ")
+        raise RuntimeError(f"{label}: HTTP {response.status_code} | {body}")
+    return response
+
+
+def server_snapshot(session: requests.Session) -> dict[str, Any]:
+    response = session.get(api_url("/api/status"), params={"_ts": time.time_ns()}, timeout=15)
+    checked_response(response, "GET /api/status")
+    return response.json()
+
+
+def preflight_hub() -> str:
+    """Verify URL, protocol, TripoSR route, token, and shared SQLite state."""
+    session = requests.Session()
+    session.headers.update(auth_headers())
+    response = session.get(api_url("/api/models"), params={"_ts": time.time_ns()}, timeout=20)
+    checked_response(response, "GET /api/models")
+    model_ids = {item.get("id") for item in response.json() if isinstance(item, dict)}
+    if "triposr" not in model_ids:
+        raise RuntimeError(f"Hub does not advertise triposr. Models={sorted(x for x in model_ids if x)}")
+
+    # Authenticated read verifies the Bearer token without claiming a task.
+    checked_response(
+        session.get(api_url("/api/failed"), params={"_ts": time.time_ns()}, timeout=20),
+        "GET /api/failed (auth check)",
+    )
+    snapshot = server_snapshot(session)
+    if snapshot.get("storage") != "sqlite":
+        raise RuntimeError(
+            "Connected Hub is an old in-memory build. Update/restart the local Hub before starting 003."
+        )
+    instance_id = str(snapshot.get("hub_instance_id") or "")
+    if not instance_id:
+        raise RuntimeError("Hub did not return hub_instance_id; local Hub and 003 protocol versions differ")
+    queued = int(snapshot.get("queued_by_model", {}).get("triposr", 0) or 0)
+    inflight = int(snapshot.get("inflight_by_model", {}).get("triposr", 0) or 0)
+    print(
+        f"[preflight] Hub OK | instance={instance_id[:12]} | storage=sqlite | "
+        f"triposr queued={queued} inflight={inflight}",
+        flush=True,
+    )
+    return instance_id
 
 
 def prefetch_model() -> None:
@@ -89,7 +140,12 @@ def export_mesh(mesh, output_format: str) -> bytes:
     return bytes(data)
 
 
-def heartbeat_loop(worker_id: str, gpu: int, stop: threading.Event) -> None:
+def heartbeat_loop(
+    worker_id: str,
+    gpu: int,
+    stop: threading.Event,
+    active_task: dict[str, int | None],
+) -> None:
     session = requests.Session()
     session.headers.update(auth_headers())
     while not stop.wait(HEARTBEAT_SECONDS):
@@ -100,6 +156,7 @@ def heartbeat_loop(worker_id: str, gpu: int, stop: threading.Event) -> None:
                     "worker_id": worker_id,
                     "local_queue": 0,
                     "upload_queue": 0,
+                    "active_task_id": active_task["id"],
                     "meta": {"gpu_index": gpu, "persistent": True},
                 },
                 timeout=15,
@@ -121,7 +178,7 @@ def report_failure(session: requests.Session, task_id: int, exc: BaseException, 
         print(f"[GPU{gpu}] fail-report error: {report_exc}", flush=True)
 
 
-def gpu_worker(gpu: int, run_id: str) -> None:
+def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
     torch.cuda.set_device(gpu)
     device = f"cuda:{gpu}"
     gpu_name = torch.cuda.get_device_name(gpu)
@@ -138,7 +195,7 @@ def gpu_worker(gpu: int, run_id: str) -> None:
 
     session = requests.Session()
     session.headers.update(auth_headers())
-    session.post(
+    register_response = session.post(
         api_url("/worker/register"),
         json={
             "worker_id": worker_id,
@@ -156,10 +213,17 @@ def gpu_worker(gpu: int, run_id: str) -> None:
             },
         },
         timeout=30,
-    ).raise_for_status()
+    )
+    checked_response(register_response, "POST /worker/register")
+    print(f"[GPU{gpu}] registered as {worker_id}", flush=True)
 
     stop = threading.Event()
-    heartbeat = threading.Thread(target=heartbeat_loop, args=(worker_id, gpu, stop), daemon=True)
+    active_task: dict[str, int | None] = {"id": None}
+    heartbeat = threading.Thread(
+        target=heartbeat_loop,
+        args=(worker_id, gpu, stop, active_task),
+        daemon=True,
+    )
     heartbeat.start()
 
     def shutdown(*_args):
@@ -168,20 +232,40 @@ def gpu_worker(gpu: int, run_id: str) -> None:
 
     signal.signal(signal.SIGTERM, shutdown)
 
+    last_idle_diagnostic = 0.0
     try:
         while True:
             task: dict[str, Any] | None = None
             try:
-                response = session.get(
-                    api_url("/task/next"),
-                    params={"model": "triposr", "worker_id": worker_id},
+                # POST cannot be cached as a stale 204 by a tunnel/CDN.
+                response = session.post(
+                    api_url("/task/claim"),
+                    json={"model": "triposr", "worker_id": worker_id, "wait_seconds": 25},
                     timeout=POLL_TIMEOUT,
                 )
+                response_instance = response.headers.get("X-Hub-Instance", "")
+                if response_instance and response_instance != hub_instance_id:
+                    raise RuntimeError(
+                        f"Hub instance changed: expected={hub_instance_id[:12]} got={response_instance[:12]}. "
+                        "Tunnel may point at multiple unrelated Hub databases."
+                    )
                 if response.status_code == 204:
+                    now = time.monotonic()
+                    if now - last_idle_diagnostic >= IDLE_DIAGNOSTIC_SECONDS:
+                        last_idle_diagnostic = now
+                        snapshot = server_snapshot(session)
+                        queued = int(snapshot.get("queued_by_model", {}).get("triposr", 0) or 0)
+                        inflight = int(snapshot.get("inflight_by_model", {}).get("triposr", 0) or 0)
+                        print(
+                            f"[GPU{gpu}] idle | Hub triposr queued={queued} inflight={inflight} "
+                            f"instance={str(snapshot.get('hub_instance_id', ''))[:12]}",
+                            flush=True,
+                        )
                     continue
-                response.raise_for_status()
+                checked_response(response, "POST /task/claim")
                 task = response.json()
                 task_id = int(task["id"])
+                active_task["id"] = task_id
                 print(
                     f"[GPU{gpu}] ↓ #{task_id} {task.get('source_label','input')} "
                     f"res={task.get('mc_resolution',256)} fmt={task.get('output_format','glb')}",
@@ -244,6 +328,7 @@ def gpu_worker(gpu: int, run_id: str) -> None:
                 )
                 upload.raise_for_status()
                 t_up = time.perf_counter()
+                active_task["id"] = None
 
                 print(
                     f"[GPU{gpu}] ✓ #{task_id} total={elapsed:.2f}s "
@@ -262,6 +347,7 @@ def gpu_worker(gpu: int, run_id: str) -> None:
             except Exception as exc:
                 if task is not None and "id" in task:
                     report_failure(session, int(task["id"]), exc, gpu)
+                    active_task["id"] = None
                 else:
                     print(f"[GPU{gpu}] poll error: {type(exc).__name__}: {exc}", flush=True)
                     time.sleep(2)
@@ -288,11 +374,12 @@ def main() -> None:
         f"TripoSR persistent worker | GPUs={gpu_count} | rembg={REMBG_MODEL} | base={BASE_URL}",
         flush=True,
     )
+    hub_instance_id = preflight_hub()
     prefetch_model()
 
     ctx = mp.get_context("spawn")
     processes = [
-        ctx.Process(target=gpu_worker, args=(gpu, run_id), name=f"triposr-gpu{gpu}")
+        ctx.Process(target=gpu_worker, args=(gpu, run_id, hub_instance_id), name=f"triposr-gpu{gpu}")
         for gpu in range(gpu_count)
     ]
     for process in processes:

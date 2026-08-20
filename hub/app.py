@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile, WebSocket
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -34,8 +34,18 @@ from .crypto import decrypt_blob
 from .prompt_pipeline import PromptPipeline, PromptPipelineError, PromptPipelineSettings
 from .state import state
 
-app = FastAPI(title="Kaggle Inference Hub", version="0.4.0")
+app = FastAPI(title="Kaggle Inference Hub", version="0.5.0")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.middleware("http")
+async def hub_response_headers(request: Request, call_next):
+    response = await call_next(request)
+    # Worker polling and diagnostics must never be cached by a tunnel/CDN.
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Hub-Instance"] = state.instance_id
+    return response
 
 prompt_pipeline = PromptPipeline(
     PromptPipelineSettings(
@@ -87,6 +97,7 @@ class HeartbeatIn(BaseModel):
     worker_id: str
     local_queue: int = 0
     upload_queue: int = 0
+    active_task_id: int | None = None
     meta: dict = Field(default_factory=dict)
 
 
@@ -94,6 +105,12 @@ class FailIn(BaseModel):
     id: int
     error: str
     requeue: bool = True
+
+
+class ClaimIn(BaseModel):
+    model: str = DEFAULT_MODEL
+    worker_id: str
+    wait_seconds: float = Field(default=25, ge=0, le=30)
 
 
 class PromptProcessIn(BaseModel):
@@ -332,9 +349,6 @@ def add_batch(x: BatchIn, authorization: str | None = Header(None)):
         pairs.append((prompt, source, meta))
     if not pairs:
         raise HTTPException(status_code=400, detail="No prompts")
-    q = state.queues[model]
-    if q.maxsize and q.qsize() + len(pairs) > q.maxsize:
-        raise HTTPException(status_code=503, detail=f"Not enough queue capacity: {model}")
     items = []
     for i, (prompt, source_prompt, prompt_meta) in enumerate(pairs):
         seed = x.seed + i if x.seed is not None else None
@@ -348,9 +362,12 @@ def add_batch(x: BatchIn, authorization: str | None = Header(None)):
             source_prompt=source_prompt,
             prompt_meta=prompt_meta,
         )
-        state.enqueue(task)
         items.append(task)
-    return {"queued": len(items), "queue_size": state.queues[model].qsize(), "tasks": items}
+    try:
+        state.enqueue_many(items)
+    except queue.Full:
+        raise HTTPException(status_code=503, detail=f"Not enough queue capacity: {model}")
+    return {"queued": len(items), "queue_size": state.queue_size(model), "tasks": items}
 
 
 @app.post("/task/triposr", status_code=202)
@@ -423,7 +440,7 @@ async def add_triposr_task(
         raise HTTPException(status_code=503, detail="Task queue is full: triposr")
     return {
         "queued": 1,
-        "queue_size": state.queues["triposr"].qsize(),
+        "queue_size": state.queue_size("triposr"),
         "task": {key: value for key, value in task.items() if not key.startswith("_")},
     }
 
@@ -440,6 +457,21 @@ async def next_task(
     if task is None:
         return Response(status_code=204)
     state.heartbeat(worker_id, {"model": model, "last_claimed_task": task["id"]})
+    return {key: value for key, value in task.items() if not key.startswith("_")}
+
+
+@app.post("/task/claim")
+async def claim_task(x: ClaimIn, authorization: str | None = Header(None)):
+    """Non-cacheable task claim endpoint used by current workers.
+
+    GET /task/next remains available for 001/002 and older workers.
+    """
+    auth(authorization)
+    model = model_or_400(x.model)
+    task = await asyncio.to_thread(state.claim, model, x.worker_id, x.wait_seconds)
+    if task is None:
+        return Response(status_code=204)
+    state.heartbeat(x.worker_id, {"model": model, "last_claimed_task": task["id"]})
     return {key: value for key, value in task.items() if not key.startswith("_")}
 
 
@@ -489,14 +521,18 @@ def worker_register(x: WorkerIn, authorization: str | None = Header(None)):
 @app.post("/worker/heartbeat")
 def worker_heartbeat(x: HeartbeatIn, authorization: str | None = Header(None)):
     auth(authorization)
+    lease_renewed = False
+    if x.active_task_id is not None:
+        lease_renewed = state.renew_lease(x.active_task_id, x.worker_id)
     item = state.heartbeat(x.worker_id, {
         "local_queue": x.local_queue,
         "upload_queue": x.upload_queue,
+        "active_task_id": x.active_task_id,
         "meta": x.meta,
     })
     if item is None:
         raise HTTPException(status_code=404, detail="Worker not registered")
-    return item
+    return {**item, "lease_renewed": lease_renewed}
 
 
 @app.get("/api/status")
@@ -505,18 +541,15 @@ def status():
 
 
 @app.get("/api/history")
-def get_history(model: str | None = None):
-    items = list(state.history)
-    if model:
-        canonical = model_or_400(model)
-        items = [x for x in items if x.get("model") == canonical]
-    return items[-300:]
+def get_history(model: str | None = None, after: int = Query(0, ge=0), limit: int = Query(300, ge=1, le=500)):
+    canonical = model_or_400(model) if model else None
+    return state.history_items(canonical, after=after, limit=limit)
 
 
 @app.get("/api/failed")
 def get_failed(authorization: str | None = Header(None)):
     auth(authorization)
-    return list(state.failed)[-200:]
+    return state.failed_items(200)
 
 
 @app.post("/upload/artifact")
@@ -584,8 +617,11 @@ async def upload_artifact(
         "download_url": f"/outputs/{model}/{name}",
         "time": time.time(),
     }
-    state.complete(id)
-    state.history.append(item)
+    try:
+        item = state.finish(id, item)
+    except KeyError:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail="Task is no longer inflight")
     state.heartbeat(worker_id, {"last_completed_task": id})
     await broadcast(item)
     return item
@@ -642,8 +678,11 @@ async def upload(
             item["source_prompt"] = leased_task["source_prompt"]
         if leased_task.get("prompt_meta"):
             item["prompt_meta"] = leased_task["prompt_meta"]
-    state.complete(id)
-    state.history.append(item)
+    try:
+        item = state.finish(id, item)
+    except KeyError:
+        path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail="Task is no longer inflight")
     state.heartbeat(worker_id, {"last_completed_task": id})
     await broadcast(item)
     return item
@@ -697,6 +736,8 @@ let MODELS={};
 let PROMPT_AI={enabled:false,configured:false,modes:[]};
 let singleAiState=null;
 let batchAiState=null;
+let lastEventId=0;
+const renderedEvents=new Set();
 
 token.value=localStorage.getItem("kaggle_hub_token")||"";
 token.addEventListener("change",()=>localStorage.setItem("kaggle_hub_token",token.value));
@@ -987,6 +1028,9 @@ function addArtifactCard(x,first){
 }
 
 function addCard(x,first=true){
+  const eventId=Number(x.event_id||0);
+  if(eventId&&renderedEvents.has(eventId))return;
+  if(eventId){renderedEvents.add(eventId);lastEventId=Math.max(lastEventId,eventId)}
   $("empty")?.remove();
   if(x.kind==='artifact'){addArtifactCard(x,first);return}
   const card=document.createElement('article');card.className='card';
@@ -1012,9 +1056,16 @@ function addCard(x,first=true){
 
 async function loadHistory(){
   const xs=await apiJson('/api/history');
-  grid.innerHTML='';
+  grid.innerHTML='';renderedEvents.clear();lastEventId=0;
   if(!xs.length){grid.innerHTML='<div class="empty" id="empty">等待第一个结果...</div>';return}
   xs.forEach(x=>addCard(x,false));
+}
+
+async function syncHistory(){
+  try{
+    const xs=await apiJson(`/api/history?after=${lastEventId}&limit=100`);
+    xs.forEach(x=>addCard(x,true));
+  }catch{}
 }
 
 async function status(){
@@ -1039,6 +1090,7 @@ async function status(){
 }
 
 setInterval(status,1500);
+setInterval(syncHistory,2000);
 updateBatchCount();
 Promise.all([initModels(),initPromptPipeline()]).then(()=>{loadHistory();status()});
 const proto=location.protocol==='https:'?'wss':'ws';

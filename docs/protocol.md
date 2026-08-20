@@ -28,9 +28,23 @@ Authorization: Bearer <KAGGLE_HUB_TOKEN>
 
 ## 2. Worker 心跳
 
-`POST /worker/heartbeat`，建议每 10 秒一次。
+`POST /worker/heartbeat`，建议每 10 秒一次。处理长任务时可携带 `active_task_id`，Hub 会续租该 Worker 持有的任务，避免推理期间租约过期。
 
 ## 3. 长轮询领取任务
+
+当前 Worker 推荐使用不可缓存的原子领取接口：
+
+```http
+POST /task/claim
+Authorization: Bearer <KAGGLE_HUB_TOKEN>
+Content-Type: application/json
+
+{"model":"triposr","worker_id":"triposr-a1b2c3d4","wait_seconds":25}
+```
+
+无任务返回 `204`，领取成功返回任务 JSON。003 使用这个接口，避免 Tunnel/CDN 缓存 GET 的空响应。
+
+以下 GET 接口继续为 001/002 和旧 Worker 保留：
 
 ```text
 GET /task/next?model=sana-sprint-1.6b&worker_id=sana-a1b2c3d4
@@ -38,7 +52,7 @@ GET /task/next?model=z-image-turbo-gguf&worker_id=zimage-a1b2c3d4
 GET /task/next?model=triposr&worker_id=triposr-a1b2c3d4
 ```
 
-服务端最多等待 25 秒。无任务返回 `204`。领取成功后任务进入 `inflight`。Worker 异常消失且租约超时后，任务自动回到对应模型队列。
+服务端最多等待 30 秒。无任务返回 `204`。领取成功后任务进入 `inflight`。队列和租约存储在 SQLite 中，因此 Uvicorn 多进程与 Hub 重启不会拆分或清空任务。Worker 异常消失且租约超时后，任务自动回到对应模型队列。
 
 ## 4. 上传结果
 
