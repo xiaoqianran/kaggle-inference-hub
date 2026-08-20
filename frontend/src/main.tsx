@@ -21,7 +21,7 @@ createRoot(document.getElementById('root')!).render(
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <App />
-        <Toaster richColors position="bottom-right" />
+        <Toaster richColors position="top-center" offset={72} closeButton />
       </TooltipProvider>
     </QueryClientProvider>
   </StrictMode>,
