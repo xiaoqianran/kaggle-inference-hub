@@ -10,6 +10,7 @@ Authorization: Bearer <KAGGLE_HUB_TOKEN>
 
 - `sana-sprint-1.6b`
 - `z-image-turbo-gguf`
+- `triposr`
 
 ## 1. Worker 注册
 
@@ -34,6 +35,7 @@ Authorization: Bearer <KAGGLE_HUB_TOKEN>
 ```text
 GET /task/next?model=sana-sprint-1.6b&worker_id=sana-a1b2c3d4
 GET /task/next?model=z-image-turbo-gguf&worker_id=zimage-a1b2c3d4
+GET /task/next?model=triposr&worker_id=triposr-a1b2c3d4
 ```
 
 服务端最多等待 25 秒。无任务返回 `204`。领取成功后任务进入 `inflight`。Worker 异常消失且租约超时后，任务自动回到对应模型队列。
@@ -49,6 +51,12 @@ WebP -> AES-GCM -> nonce(12 bytes) + ciphertext
 ```
 
 密钥：`SHA256(KAGGLE_HUB_TOKEN)`。
+
+### TripoSR 图片任务
+
+本地客户端向 `POST /task/triposr` 发送 multipart：二选一提供 `file` 或 `source_url`，并可提供 `output_format`、`mc_resolution`、`chunk_size`、`foreground_ratio`、`remove_background`。
+
+Worker 领取任务后，用相同 Bearer Token 请求返回的 `input_url`（即 `GET /task/input/{id}`）。完成后向 `POST /upload/artifact` 上传 AES-GCM 加密的 GLB/OBJ；multipart 字段为 `file`、`id`、`model`、`worker_id`、`gpu`、`seconds`、`output_format`，可附加 `vertices`、`faces`。
 
 ## 5. 任务失败
 
