@@ -126,6 +126,10 @@ def test_http_protocol(directory: Path) -> None:
     png = b"\x89PNG\r\n\x1a\n" + b"test-image"
 
     with TestClient(module.app) as client:
+        index = client.get("/")
+        assert index.status_code == 200
+        assert "Kaggle Inference Hub" in index.text
+
         queued = client.post(
             "/task/triposr",
             headers=headers,
