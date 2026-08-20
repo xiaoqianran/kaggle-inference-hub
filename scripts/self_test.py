@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -40,7 +41,25 @@ def main():
     assert "Return the final prompt in English" in system_prompt
     assert PromptPipeline._clean_output('Prompt: "a red cube"') == "a red cube"
 
-    print("OK: prompt/image-to-3D routing + queue isolation + AES-GCM + prompt pipeline")
+    root = Path(__file__).resolve().parents[1]
+    tripo_nb = root / "notebooks" / "003-triposr-image-to-3d.ipynb"
+    tripo_worker = root / "notebooks" / "triposr_worker.py"
+    assert tripo_nb.is_file()
+    assert tripo_worker.is_file()
+    assert not (root / "notebooks" / "003-triposr-build.ipynb").exists()
+    notebook = json.loads(tripo_nb.read_text(encoding="utf-8"))
+    notebook_text = "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
+    worker_text = tripo_worker.read_text(encoding="utf-8")
+    assert '"rembg[gpu]"' in notebook_text
+    assert '"onnxruntime"' not in notebook_text
+    assert '"device_id": gpu' in worker_text
+    assert 'triposr-persistent-py310' in worker_text
+    assert 'mp.get_context("spawn")' in worker_text
+    assert 'UserSecretsClient' in notebook_text
+    assert 'os.getenv("KAGGLE_HUB_TOKEN"' in notebook_text
+    assert 'print("Token: wangran")' not in notebook_text
+
+    print("OK: prompt/image-to-3D routing + queue isolation + AES-GCM + persistent dual-GPU TripoSR worker")
 
 
 if __name__ == "__main__":

@@ -58,6 +58,8 @@ WebP -> AES-GCM -> nonce(12 bytes) + ciphertext
 
 Worker 领取任务后，用相同 Bearer Token 请求返回的 `input_url`（即 `GET /task/input/{id}`）。完成后向 `POST /upload/artifact` 上传 AES-GCM 加密的 GLB/OBJ；multipart 字段为 `file`、`id`、`model`、`worker_id`、`gpu`、`seconds`、`output_format`，可附加 `vertices`、`faces`。
 
+003 TripoSR Notebook 会启动两个长期存活的 GPU Worker 进程（例如 `triposr-<run>-g0` / `triposr-<run>-g1`），每个进程 `concurrency=1`，分别常驻一份 TripoSR 模型和一个绑定到对应 GPU `device_id` 的 rembg CUDA Session。这样两张 T4 独立领取任务，避免每个任务重新加载模型，也避免两个 rembg Session 都默认占用 GPU0。
+
 ## 5. 任务失败
 
 `POST /task/fail`：

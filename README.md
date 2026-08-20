@@ -6,7 +6,7 @@
 
 - **SANA Sprint 1.6B** — Diffusers，2×T4 各自常驻一份 Pipeline。
 - **Z-Image-Turbo GGUF** — `stable-diffusion.cpp`，使用 `kaggle-build` Release 的 T4 `sm_75` 预编译 runtime，2×T4 各自常驻一个 `sd-server`。
-- **TripoSR** — 官方单图 3D 重建模型，2×T4 各自常驻一份模型，生成 GLB 或 OBJ。
+- **TripoSR** — 官方单图 3D 重建模型，Kaggle Python 3.10 独立 venv；2×T4 各自常驻一份 TripoSR + GPU rembg Session，生成 GLB 或 OBJ。
 
 ## 架构
 
@@ -50,6 +50,20 @@ uv run python recv.py
 uv run uvicorn recv:app --host 0.0.0.0 --port 30100 --reload
 ```
 
+## 打包源码
+
+不要直接使用资源管理器的“压缩为 ZIP”，因为它不会读取 `.gitignore`。使用下面的命令会生成 `dist/kaggle-image-inference-hub.zip`，自动排除 `.venv/`、`.git/`、缓存、`outputs/`、`sana_received/` 和本地配置：
+
+```powershell
+uv run python scripts/package.py
+```
+
+也可以指定输出路径：
+
+```powershell
+uv run python scripts/package.py --output D:\release\kaggle-image-inference-hub.zip
+```
+
 ## Cloudflare Tunnel
 
 ```powershell
@@ -73,7 +87,11 @@ cloudflared tunnel --url http://localhost:30100
 5. 周期性发送心跳。
 6. 失败时通知本地服务进行有限次数重试。
 
+TripoSR 的 003 Notebook 采用专门的常驻架构：Notebook 内核仍可为 Python 3.12，但通过 Kaggle 自带 `uv` 创建 `/kaggle/working/TripoSR/.venv`（Python 3.10）。Notebook 只负责写入并启动 `kaggle_worker.py`；真正的 TripoSR、PyTorch、rembg 都只在这个 Python 3.10 进程体系中运行。父进程先缓存模型，然后为 GPU0/GPU1 各启动一个独立 Worker 进程，因此模型初始化只发生一次。
+
 TripoSR Notebook 需要在 Kaggle 启用 **GPU T4 x2** 与 **Internet**。推荐在 Add-ons → Secrets 中添加 `BASE_URL` 和 `KAGGLE_HUB_TOKEN`。本地 UI 可以直接上传 PNG/JPEG/WebP，也可以在 SANA、Z-Image 或其他接入 Hub 的生成图卡片上点击“转为 3D”。默认输出带顶点色的 GLB，也可选择 OBJ。
+
+TripoSR Runtime 固定为 PyTorch `2.7.1+cu128`，`torchmcubes` 直接从 `xiaoqianran/kaggle-build` 的 `triposr-py310-torch2.7.1-cu128-sm75` Release 安装预编译 wheel，不再在 Kaggle 上执行 CMake/NVCC。`rembg[gpu]` 使用 `onnxruntime-gpu`，并将两个 ONNX Session 分别绑定到 `device_id=0/1`；默认 `u2net`，如更重视速度可在启动 Cell 改为 `u2netp`。
 
 其他本地模型也可以把刚生成的文件直接送入队列：
 
