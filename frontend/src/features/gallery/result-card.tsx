@@ -1,4 +1,4 @@
-import { Box, Clock3, Download, Eye, Maximize2, Sparkles } from 'lucide-react'
+import { Box, Clock3, Download, Eye, Maximize2, RefreshCw, Sparkles } from 'lucide-react'
 import { lazy, Suspense, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { ImagePreviewDialog } from '@/features/gallery/image-preview'
 import type { HistoryItem } from '@/shared/api/types'
+import { getTripoResolutionOption } from '@/shared/tripo-resolution'
 
 const GlbPreviewSheet = lazy(async () => {
   const module = await import('@/features/gallery/glb-preview')
@@ -17,6 +18,10 @@ type ResultCardProps = {
   modelLabel: string
   onConvertTo3d?: (sourceUrl: string) => void
   isConverting?: boolean
+  selected?: boolean
+  onSelectedChange?: (selected: boolean) => void
+  onRegenerate?: () => void
+  isRegenerating?: boolean
 }
 
 const resultDateFormatter = new Intl.DateTimeFormat('zh-CN', {
@@ -26,13 +31,23 @@ const resultDateFormatter = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
 })
 
-export function ResultCard({ item, modelLabel, onConvertTo3d, isConverting = false }: ResultCardProps) {
+export function ResultCard({
+  item,
+  modelLabel,
+  onConvertTo3d,
+  isConverting = false,
+  selected = false,
+  onSelectedChange,
+  onRegenerate,
+  isRegenerating = false,
+}: ResultCardProps) {
   const createdAt = resultDateFormatter.format(new Date(item.time * 1000))
   const [previewOpen, setPreviewOpen] = useState(false)
   const [imagePreviewOpen, setImagePreviewOpen] = useState(false)
 
   if (item.kind === 'artifact') {
     const format = item.output_format.toUpperCase()
+    const resolution = item.mc_resolution ? getTripoResolutionOption(item.mc_resolution) : null
     return (
       <Card className="result-card group overflow-hidden border-border bg-card py-0 shadow-sm transition hover:-translate-y-0.5 hover:border-primary/45 hover:shadow-lg">
         <div className="relative aspect-square overflow-hidden bg-[var(--ctp-mantle)]">
@@ -47,7 +62,18 @@ export function ResultCard({ item, modelLabel, onConvertTo3d, isConverting = fal
           ) : (
             <div className="flex size-full items-center justify-center"><Box className="size-10 text-muted-foreground" /></div>
           )}
-          <Badge className="absolute left-3 top-3 gap-1.5 shadow-md"><Box className="size-3" /> 3D READY</Badge>
+          {onSelectedChange ? (
+            <label className="absolute left-3 top-3 z-10 flex size-7 cursor-pointer items-center justify-center rounded-md bg-[var(--ctp-crust)]/85 shadow-md backdrop-blur">
+              <input
+                type="checkbox"
+                aria-label={`选择 ${item.source_label ?? `3D 资产 ${item.id}`}`}
+                checked={selected}
+                onChange={(event) => onSelectedChange(event.target.checked)}
+                className="size-4 accent-[var(--ctp-blue)]"
+              />
+            </label>
+          ) : null}
+          <Badge className="absolute left-12 top-3 gap-1.5 shadow-md"><Box className="size-3" /> 3D READY</Badge>
           <span className="absolute right-3 top-3 rounded-md bg-[var(--ctp-crust)]/85 px-2 py-1 font-mono text-[9px] text-[var(--ctp-subtext0)] backdrop-blur">#{item.id}</span>
         </div>
         <CardContent className="flex min-h-44 flex-col p-4">
@@ -57,6 +83,7 @@ export function ResultCard({ item, modelLabel, onConvertTo3d, isConverting = fal
           </div>
           <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[9px] uppercase text-[var(--ctp-overlay1)]">
             <span>{format}</span>
+            <span title={resolution?.description}>{resolution ? `网格：${resolution.name} · ${item.mc_resolution}³` : '网格：未记录'}</span>
             {item.vertices ? <span>{item.vertices.toLocaleString()} vertices</span> : null}
             {item.faces ? <span>{item.faces.toLocaleString()} faces</span> : null}
           </div>
@@ -69,6 +96,18 @@ export function ResultCard({ item, modelLabel, onConvertTo3d, isConverting = fal
             <Button asChild className={item.output_format === 'glb' ? '' : 'col-span-2'}>
               <a href={item.download_url} download><Download className="size-4" /> 下载 {format}</a>
             </Button>
+            {onRegenerate ? (
+              <Button
+                type="button"
+                variant="outline"
+                className="col-span-2"
+                onClick={onRegenerate}
+                disabled={isRegenerating}
+              >
+                <RefreshCw className={`size-3.5 ${isRegenerating ? 'animate-spin' : ''}`} />
+                {isRegenerating ? '提交中…' : '重新生成'}
+              </Button>
+            ) : null}
           </div>
           {item.output_format === 'glb' ? (
             previewOpen ? (

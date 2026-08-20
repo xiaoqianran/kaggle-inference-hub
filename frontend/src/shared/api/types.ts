@@ -1,3 +1,5 @@
+import type { TripoResolution } from '@/shared/tripo-resolution'
+
 export type ModelSpec = {
   id: string
   label: string
@@ -93,7 +95,7 @@ export type QueueResponse = {
 
 export type TripoSettings = {
   outputFormat: 'glb' | 'obj'
-  resolution: 128 | 256 | 384 | 512
+  resolution: TripoResolution
   removeBackground: boolean
 }
 
@@ -157,6 +159,8 @@ export type ArtifactResult = ResultBase & {
   download_url: string
   vertices?: number
   faces?: number
+  mc_resolution?: number
+  remove_background?: boolean
 }
 
 export type HistoryItem = ImageResult | ArtifactResult

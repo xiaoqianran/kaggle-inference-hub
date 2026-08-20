@@ -1,4 +1,4 @@
-import { Box, Upload } from 'lucide-react'
+import { Box, Info, Upload } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 
@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch'
 import { useSubmitTripo } from '@/features/triposr/use-submit-tripo'
 import type { HubStatus, TripoSettings } from '@/shared/api/types'
+import { TRIPO_RESOLUTION_OPTIONS, getTripoResolutionOption } from '@/shared/tripo-resolution'
 
 type TripoPanelProps = {
   token: string
@@ -22,6 +23,7 @@ export function TripoPanel({ token, settings, onSettingsChange, status }: TripoP
   const inputRef = useRef<HTMLInputElement>(null)
   const [file, setFile] = useState<File | null>(null)
   const submit = useSubmitTripo(token)
+  const selectedResolution = getTripoResolutionOption(settings.resolution)
 
   const submitFile = () => {
     if (!file) return toast.error('请选择一张 PNG、JPEG 或 WebP 图片')
@@ -74,21 +76,31 @@ export function TripoPanel({ token, settings, onSettingsChange, status }: TripoP
             </Select>
           </div>
           <div className="space-y-2">
-            <Label htmlFor="tripo-resolution">MC Resolution</Label>
+            <Label htmlFor="tripo-resolution">模型细节（MC 网格）</Label>
             <Select
               value={String(settings.resolution)}
               onValueChange={(value) =>
                 onSettingsChange({ ...settings, resolution: Number(value) as TripoSettings['resolution'] })
               }
             >
-              <SelectTrigger id="tripo-resolution" className="w-full"><SelectValue /></SelectTrigger>
+              <SelectTrigger id="tripo-resolution" className="w-full">
+                <SelectValue>{selectedResolution.shortLabel}</SelectValue>
+              </SelectTrigger>
               <SelectContent>
-                <SelectItem value="128">128 · 快速</SelectItem>
-                <SelectItem value="256">256 · 标准</SelectItem>
-                <SelectItem value="384">384 · 精细</SelectItem>
-                <SelectItem value="512">512 · 高显存</SelectItem>
+                {TRIPO_RESOLUTION_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={String(option.value)} textValue={option.shortLabel}>
+                    <span className="flex flex-col items-start gap-0.5 py-0.5">
+                      <span className="font-medium">{option.shortLabel}</span>
+                      <span className="text-[10px] leading-tight text-muted-foreground">{option.description}</span>
+                    </span>
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
+            <p className="flex items-start gap-1 text-[10px] leading-relaxed text-muted-foreground">
+              <Info className="mt-0.5 size-3 shrink-0" />
+              数字越大，3D 表面网格越细；不是输入图片尺寸，会增加生成时间和显存占用。
+            </p>
           </div>
         </div>
 

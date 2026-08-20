@@ -133,6 +133,10 @@ class PromptBatchProcessIn(BaseModel):
     translate_to_english: bool = True
 
 
+class HistoryDeleteIn(BaseModel):
+    event_ids: list[int] = Field(min_length=1, max_length=300)
+
+
 def auth(authorization: str | None) -> None:
     if authorization != f"Bearer {TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -177,6 +181,20 @@ def local_output_path(url: str) -> Path:
         raise HTTPException(status_code=413, detail="Source image is too large")
     if image_suffix(candidate.read_bytes()[:16]) is None:
         raise HTTPException(status_code=400, detail="Source must be PNG, JPEG, or WebP")
+    return candidate
+
+
+def local_asset_path(url: str) -> Path | None:
+    """Resolve a stored output URL for cleanup without accepting arbitrary paths."""
+    path = unquote(urlsplit(url).path)
+    prefixes = ("/images/", "/outputs/")
+    prefix = next((item for item in prefixes if path.startswith(item)), None)
+    if prefix is None:
+        return None
+    root = OUTPUT_DIR.resolve()
+    candidate = (root / path[len(prefix):]).resolve()
+    if not candidate.is_relative_to(root) or not candidate.is_file():
+        return None
     return candidate
 
 
@@ -552,6 +570,19 @@ def get_history(model: str | None = None, after: int = Query(0, ge=0), limit: in
     return state.history_items(canonical, after=after, limit=limit)
 
 
+@app.delete("/api/history/batch")
+def delete_history_batch(x: HistoryDeleteIn, authorization: str | None = Header(None)):
+    auth(authorization)
+    items = state.delete_history_items(x.event_ids)
+    deleted = 0
+    for item in items:
+        asset_path = local_asset_path(str(item.get("download_url", "")))
+        if asset_path is not None:
+            asset_path.unlink(missing_ok=True)
+        deleted += 1
+    return {"deleted": deleted, "event_ids": [int(item["event_id"]) for item in items]}
+
+
 @app.get("/api/failed")
 def get_failed(authorization: str | None = Header(None)):
     auth(authorization)
@@ -618,6 +649,8 @@ async def upload_artifact(
         "output_format": output_format,
         "vertices": vertices,
         "faces": faces,
+        "mc_resolution": leased_task.get("mc_resolution"),
+        "remove_background": leased_task.get("remove_background"),
         "source_url": leased_task.get("source_url", ""),
         "source_label": leased_task.get("source_label", "input image"),
         "download_url": f"/outputs/{model}/{name}",

@@ -1,12 +1,17 @@
 import { Box, ChevronLeft, ChevronRight, ImageIcon, RefreshCw } from 'lucide-react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
+import { toast } from 'sonner'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ResultCard, ResultCardSkeleton } from '@/features/gallery/result-card'
 import { useSubmitTripo } from '@/features/triposr/use-submit-tripo'
+import { deleteHistoryBatch } from '@/shared/api/client'
+import { queryKeys } from '@/shared/api/queries'
+import { getTripoResolutionOption } from '@/shared/tripo-resolution'
 import type { WorkspaceKind } from '@/features/status/workspace-header'
-import type { HistoryItem, ModelSpec, TripoSettings } from '@/shared/api/types'
+import type { ArtifactResult, HistoryItem, ModelSpec, TripoSettings } from '@/shared/api/types'
 
 type GalleryProps = {
   workspace: Extract<WorkspaceKind, 'image' | '3d'>
@@ -41,14 +46,104 @@ export function Gallery({
   isRefreshing,
   onRefresh,
 }: GalleryProps) {
+  const queryClient = useQueryClient()
   const submitTripo = useSubmitTripo(token)
+  const regenerateTripo = useSubmitTripo(token, { notify: false })
+  const deleteMutation = useMutation({
+    mutationFn: (eventIds: number[]) => deleteHistoryBatch(token, eventIds),
+    onSuccess: (result) => {
+      toast.success(`已删除 ${result.deleted} 个 3D 资产`)
+      void queryClient.invalidateQueries({ queryKey: queryKeys.history })
+      void queryClient.invalidateQueries({ queryKey: queryKeys.status })
+    },
+    onError: (error) => {
+      toast.error(`批量删除失败：${error instanceof Error ? error.message : '未知错误'}`)
+    },
+  })
   const newestFirst = items.toReversed()
   const pageCount = Math.max(1, Math.ceil(newestFirst.length / PAGE_SIZE))
   const [currentPage, setCurrentPage] = useState(1)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [regeneratingIds, setRegeneratingIds] = useState<Set<number>>(new Set())
+  const [batchRegenerating, setBatchRegenerating] = useState(false)
   const isImage = workspace === 'image'
+  const is3d = workspace === '3d'
   const GalleryIcon = isImage ? ImageIcon : Box
   const activePage = Math.min(currentPage, pageCount)
   const visibleItems = newestFirst.slice((activePage - 1) * PAGE_SIZE, activePage * PAGE_SIZE)
+  const selectedResolution = getTripoResolutionOption(tripoSettings.resolution)
+  const selectedItems = newestFirst.filter(
+    (item): item is ArtifactResult => item.kind === 'artifact' && selectedIds.has(item.event_id),
+  )
+  const allVisibleSelected = !isImage && visibleItems.length > 0 && visibleItems.every((item) => selectedIds.has(item.event_id))
+
+  const setSelected = (eventId: number, selected: boolean) => {
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      if (selected) next.add(eventId)
+      else next.delete(eventId)
+      return next
+    })
+  }
+
+  const toggleVisibleSelection = () => {
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      for (const item of visibleItems) {
+        if (allVisibleSelected) next.delete(item.event_id)
+        else next.add(item.event_id)
+      }
+      return next
+    })
+  }
+
+  const regenerateOne = async (item: ArtifactResult) => {
+    if (!item.source_url) {
+      toast.error('这个资产没有保存原图，无法重新生成')
+      return
+    }
+    setRegeneratingIds((current) => new Set(current).add(item.event_id))
+    try {
+      const result = await regenerateTripo.mutateAsync({ kind: 'source', sourceUrl: item.source_url, settings: tripoSettings })
+      toast.success(`#${result.task.id} 已重新加入队列 · ${selectedResolution.shortLabel}`)
+    } catch (error) {
+      toast.error(`重新生成失败：${error instanceof Error ? error.message : '未知错误'}`)
+    } finally {
+      setRegeneratingIds((current) => {
+        const next = new Set(current)
+        next.delete(item.event_id)
+        return next
+      })
+    }
+  }
+
+  const regenerateSelected = async () => {
+    const targets = selectedItems.filter((item) => item.source_url)
+    if (!targets.length) {
+      toast.error('所选资产没有可用原图')
+      return
+    }
+    setBatchRegenerating(true)
+    setRegeneratingIds(new Set(targets.map((item) => item.event_id)))
+    const results = await Promise.allSettled(
+      targets.map((item) => regenerateTripo.mutateAsync({ kind: 'source', sourceUrl: item.source_url!, settings: tripoSettings })),
+    )
+    const succeeded = results.filter((result) => result.status === 'fulfilled').length
+    const failed = results.length - succeeded
+    setBatchRegenerating(false)
+    setRegeneratingIds(new Set())
+    setSelectedIds(new Set())
+    if (failed) toast.error(`${succeeded} 个已提交，${failed} 个失败`)
+    else toast.success(`已提交 ${succeeded} 个重新生成任务 · ${selectedResolution.shortLabel}`)
+  }
+
+  const deleteSelected = () => {
+    if (!selectedItems.length || deleteMutation.isPending) return
+    if (!window.confirm(`确定删除选中的 ${selectedItems.length} 个 3D 资产吗？下载文件也会被删除。`)) return
+    deleteMutation.mutate(selectedItems.map((item) => item.event_id), {
+      onSuccess: () => setSelectedIds(new Set()),
+    })
+  }
 
   return (
     <section className="min-w-0">
@@ -69,6 +164,31 @@ export function Gallery({
         </Button>
       </div>
 
+      {is3d && !isLoading && newestFirst.length ? (
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-[var(--ctp-mantle)]/55 px-3 py-2.5">
+          <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              aria-label="选择当前页全部 3D 资产"
+              checked={allVisibleSelected}
+              onChange={toggleVisibleSelection}
+              className="size-4 accent-[var(--ctp-blue)]"
+            />
+            <span>选择当前页</span>
+            {selectedItems.length ? <Badge variant="secondary" className="font-mono text-[9px]">已选 {selectedItems.length}</Badge> : null}
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-mono text-[10px] text-muted-foreground">重新生成使用：{selectedResolution.shortLabel}</span>
+            <Button type="button" variant="outline" size="sm" onClick={regenerateSelected} disabled={!selectedItems.length || batchRegenerating || deleteMutation.isPending}>
+              <RefreshCw className={`size-3.5 ${batchRegenerating ? 'animate-spin' : ''}`} /> 批量重新生成
+            </Button>
+            <Button type="button" variant="destructive" size="sm" onClick={deleteSelected} disabled={!selectedItems.length || deleteMutation.isPending || batchRegenerating}>
+              删除 {selectedItems.length ? `(${selectedItems.length})` : ''}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
       {isLoading ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
           {Array.from({ length: 8 }, (_, index) => <ResultCardSkeleton key={index} />)}
@@ -80,6 +200,10 @@ export function Gallery({
               key={item.event_id}
               item={item}
               modelLabel={model?.label ?? item.model}
+              selected={!isImage && selectedIds.has(item.event_id)}
+              onSelectedChange={!isImage ? (selected) => setSelected(item.event_id, selected) : undefined}
+              onRegenerate={!isImage && item.kind === 'artifact' ? () => void regenerateOne(item) : undefined}
+              isRegenerating={!isImage && item.kind === 'artifact' && (regeneratingIds.has(item.event_id) || batchRegenerating)}
               onConvertTo3d={
                 item.kind === 'image'
                   ? (sourceUrl) => submitTripo.mutate({ kind: 'source', sourceUrl, settings: tripoSettings })

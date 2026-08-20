@@ -66,6 +66,14 @@ export function getHistory(): Promise<HistoryItem[]> {
   return requestJson('/api/history?limit=300')
 }
 
+export function deleteHistoryBatch(token: string, eventIds: number[]): Promise<{ deleted: number; event_ids: number[] }> {
+  return requestJson('/api/history/batch', {
+    method: 'DELETE',
+    headers: authorizedJson(token),
+    body: JSON.stringify({ event_ids: eventIds }),
+  })
+}
+
 export function processPrompt(token: string, input: PromptProcessRequest): Promise<PromptProcessResult> {
   return requestJson('/api/prompt/process', {
     method: 'POST',

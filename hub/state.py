@@ -470,6 +470,30 @@ class HubState:
             ).fetchall()
             return [self._load(row["payload"]) for row in reversed(rows)]
 
+    def delete_history_items(self, event_ids: Iterable[int]) -> list[dict[str, Any]]:
+        """Delete history rows and return their payloads for associated file cleanup."""
+        ids = sorted({int(event_id) for event_id in event_ids})
+        if not ids:
+            return []
+
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    f"SELECT event_id, payload FROM history WHERE event_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                connection.execute(
+                    f"DELETE FROM history WHERE event_id IN ({placeholders})",
+                    ids,
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return [self._load(row["payload"]) for row in rows]
+
     def failed_items(self, limit: int = 200) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
