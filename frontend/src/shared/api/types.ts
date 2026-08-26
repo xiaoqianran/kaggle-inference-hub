@@ -101,6 +101,14 @@ export type TripoSubmission =
   | { kind: 'file'; file: File; settings: TripoSettings }
   | { kind: 'source'; sourceUrl: string; settings: TripoSettings }
 
+export type FastSam3DSettings = {
+  seed: number
+}
+
+export type FastSam3DSubmission =
+  | { kind: 'file'; file: File; mask: File; settings: FastSam3DSettings }
+  | { kind: 'source'; sourceUrl: string; mask: File; settings: FastSam3DSettings }
+
 export type Worker = {
   worker_id: string
   model: string

@@ -8,7 +8,7 @@ import { ModelTopbar } from '@/features/status/model-topbar'
 import { WorkspaceHeader, type WorkspaceKind } from '@/features/status/workspace-header'
 import { useHubSocket } from '@/hooks/use-hub-socket'
 import { historyQuery, modelsQuery, promptPipelineQuery, statusQuery } from '@/shared/api/queries'
-import type { TripoSettings } from '@/shared/api/types'
+import type { FastSam3DSettings, TripoSettings } from '@/shared/api/types'
 
 const DEFAULT_MODEL = 'sana-sprint-1.6b'
 const GenerationPanel = lazy(async () => {
@@ -22,6 +22,10 @@ const ControlCenterSheet = lazy(async () => {
 const TripoPanel = lazy(async () => {
   const module = await import('@/features/triposr/triposr-panel')
   return { default: module.TripoPanel }
+})
+const FastSam3DPanel = lazy(async () => {
+  const module = await import('@/features/fast-sam3d/fast-sam3d-panel')
+  return { default: module.FastSam3DPanel }
 })
 const VideoWorkspace = lazy(async () => {
   const module = await import('@/features/video/video-workspace')
@@ -44,6 +48,7 @@ export default function App() {
     resolution: 256,
     removeBackground: true,
   })
+  const [fastSam3DSettings, setFastSam3DSettings] = useState<FastSam3DSettings>({ seed: 42 })
 
   const models = useQuery(modelsQuery)
   const pipeline = useQuery(promptPipelineQuery)
@@ -56,7 +61,9 @@ export default function App() {
   }, [token])
 
   const imageModels = models.data?.filter((model) => model.output_kind === 'image') ?? []
+  const artifactModels = models.data?.filter((model) => model.output_kind === 'artifact') ?? []
   const currentModel = imageModels.find((model) => model.id === selectedModel) ?? imageModels[0]
+  const currentArtifactModel = artifactModels.find((model) => model.id === selectedModel) ?? artifactModels[0]
   const resultCounts = useMemo(() => {
     const counts: Record<string, number> = {}
     for (const item of history.data ?? []) counts[item.model] = (counts[item.model] ?? 0) + 1
@@ -73,8 +80,9 @@ export default function App() {
   const imageItems = currentModel
     ? historyItems.filter((item) => item.kind === 'image' && item.model === currentModel.id)
     : []
-  const artifactItems = historyItems.filter((item) => item.kind === 'artifact')
-  const tripoModel = models.data?.find((model) => model.output_kind === 'artifact')
+  const artifactItems = currentArtifactModel
+    ? historyItems.filter((item) => item.kind === 'artifact' && item.model === currentArtifactModel.id)
+    : []
 
   return (
     <div className="min-h-svh bg-background">
@@ -88,7 +96,7 @@ export default function App() {
       <ModelTopbar
         workspace={workspace}
         models={models.data ?? []}
-        selectedModel={workspace === '3d' ? tripoModel?.id ?? 'triposr' : currentModel?.id ?? selectedModel}
+        selectedModel={workspace === '3d' ? currentArtifactModel?.id ?? 'triposr' : currentModel?.id ?? selectedModel}
         onSelectedModelChange={updateModel}
         status={status.data}
         resultCounts={resultCounts}
@@ -133,20 +141,29 @@ export default function App() {
             />
         ) : null}
 
-        {workspace === '3d' ? (
+        {workspace === '3d' && currentArtifactModel ? (
           <aside className="lg:sticky lg:top-20 lg:self-start">
             <Suspense fallback={<WorkspaceFallback />}>
-              <TripoPanel token={token} settings={tripoSettings} onSettingsChange={setTripoSettings} status={status.data} />
+              {currentArtifactModel.id === 'fast-sam3d' ? (
+                <FastSam3DPanel
+                  token={token}
+                  settings={fastSam3DSettings}
+                  onSettingsChange={setFastSam3DSettings}
+                  status={status.data}
+                />
+              ) : (
+                <TripoPanel token={token} settings={tripoSettings} onSettingsChange={setTripoSettings} status={status.data} />
+              )}
             </Suspense>
           </aside>
         ) : null}
 
-        {workspace === '3d' ? (
+        {workspace === '3d' && currentArtifactModel ? (
             <Gallery
-              key="artifacts"
+              key={currentArtifactModel.id}
               workspace="3d"
               items={artifactItems}
-              model={tripoModel}
+              model={currentArtifactModel}
               token={token}
               tripoSettings={tripoSettings}
               isLoading={history.isLoading}

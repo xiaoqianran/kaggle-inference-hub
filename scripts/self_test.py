@@ -174,11 +174,59 @@ def test_http_protocol(directory: Path) -> None:
         assert status["storage"] == "sqlite" and status["inflight"] == 0
 
 
+        fast_queued = client.post(
+            "/task/fast-sam3d",
+            headers=headers,
+            data={"seed": "42"},
+            files={
+                "file": ("chair.png", png, "image/png"),
+                "mask": ("mask.png", png, "image/png"),
+            },
+        )
+        assert fast_queued.status_code == 202, fast_queued.text
+        fast_task_id = fast_queued.json()["task"]["id"]
+        fast_claimed = client.post(
+            "/task/claim",
+            headers=headers,
+            json={"model": "fast-sam3d", "worker_id": "fast-http-gpu-0", "wait_seconds": 0},
+        )
+        assert fast_claimed.status_code == 200, fast_claimed.text
+        fast_task = fast_claimed.json()
+        assert fast_task["id"] == fast_task_id
+        assert fast_task["model"] == "fast-sam3d"
+        assert fast_task["output_format"] == "glb"
+        assert client.get(fast_task["input_url"], headers=headers).content == png
+        assert client.get(fast_task["mask_url"], headers=headers).content == png
+
+        fast_nonce = os.urandom(12)
+        fast_encrypted = fast_nonce + AESGCM(key).encrypt(fast_nonce, glb, None)
+        fast_uploaded = client.post(
+            "/upload/artifact",
+            headers=headers,
+            data={
+                "id": str(fast_task_id),
+                "gpu": "0",
+                "model": "fast-sam3d",
+                "worker_id": "fast-http-gpu-0",
+                "output_format": "glb",
+            },
+            files={"file": ("fast.glb.bin", fast_encrypted, "application/octet-stream")},
+        )
+        assert fast_uploaded.status_code == 200, fast_uploaded.text
+        assert fast_uploaded.json()["event_id"] == 2
+        assert fast_uploaded.json()["model"] == "fast-sam3d"
+        status = client.get("/api/status").json()
+        assert status["storage"] == "sqlite" and status["inflight"] == 0
+
+
 def main():
     assert canonical_model("sana") == "sana-sprint-1.6b"
     assert canonical_model("zimage") == "z-image-turbo-gguf"
     assert canonical_model("tripo-sr") == "triposr"
+    assert canonical_model("sam3d") == "fast-sam3d"
     assert MODEL_SPECS["triposr"].input_kind == "image"
+    assert MODEL_SPECS["fast-sam3d"].input_kind == "image"
+    assert MODEL_SPECS["fast-sam3d"].output_kind == "artifact"
 
     with tempfile.TemporaryDirectory(prefix="kaggle-hub-test-") as directory:
         test_root = Path(directory)
@@ -200,6 +248,8 @@ def main():
     root = Path(__file__).resolve().parents[1]
     tripo_nb = root / "notebooks" / "003-triposr-image-to-3d.ipynb"
     tripo_worker = root / "notebooks" / "triposr_worker.py"
+    fast_nb = root / "notebooks" / "007-fast-sam3d.ipynb"
+    fast_worker = root / "notebooks" / "fast_sam3d_worker.py"
     assert tripo_nb.is_file()
     assert tripo_worker.is_file()
     assert not (root / "notebooks" / "003-triposr-build.ipynb").exists()
@@ -217,9 +267,23 @@ def main():
     assert 'mp.get_context("spawn")' in worker_text
     assert 'print("Token: wangran")' not in notebook_text
 
+    assert fast_nb.is_file() and fast_worker.is_file()
+    fast_notebook = json.loads(fast_nb.read_text(encoding="utf-8"))
+    fast_notebook_text = "\n".join("".join(cell.get("source", [])) for cell in fast_notebook["cells"])
+    fast_worker_text = fast_worker.read_text(encoding="utf-8")
+    assert embedded_worker(fast_notebook) == fast_worker_text
+    assert '"model": MODEL' in fast_worker_text
+    assert 'MODEL = "fast-sam3d"' in fast_worker_text
+    assert 'mp.get_context("spawn")' in fast_worker_text
+    assert '"active_task_id": active_task["id"]' in fast_worker_text
+    assert 'output = inference(image, mask, seed=seed)' in fast_worker_text
+    assert 'Fast-SAM3D · Kaggle 双 T4 常驻 Worker' in fast_notebook_text
+    assert 'update-alternatives' not in fast_notebook_text
+    assert 'KAGGLE_HUB_TOKEN' in fast_notebook_text
+
     print(
         "OK: SQLite cross-process queue + atomic claims + durable leases/history + "
-        "AES-GCM + synchronized persistent dual-GPU TripoSR worker"
+        "AES-GCM + synchronized persistent dual-GPU TripoSR/Fast-SAM3D workers"
     )
 
 

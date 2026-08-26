@@ -1,5 +1,6 @@
 import type {
   BatchTaskRequest,
+  FastSam3DSubmission,
   HistoryItem,
   HubStatus,
   ModelSpec,
@@ -116,6 +117,24 @@ export function queueTripoTask(token: string, submission: TripoSubmission): Prom
   }
 
   return requestJson('/task/triposr', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  })
+}
+
+export function queueFastSam3DTask(token: string, submission: FastSam3DSubmission): Promise<QueueResponse> {
+  const form = new FormData()
+  form.append('mask', submission.mask, submission.mask.name)
+  form.append('seed', String(submission.settings.seed))
+
+  if (submission.kind === 'file') {
+    form.append('file', submission.file, submission.file.name)
+  } else {
+    form.append('source_url', submission.sourceUrl)
+  }
+
+  return requestJson('/task/fast-sam3d', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: form,

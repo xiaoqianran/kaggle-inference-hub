@@ -36,6 +36,14 @@ MODEL_SPECS = {
         input_kind="image",
         output_kind="artifact",
     ),
+    "fast-sam3d": ModelSpec(
+        id="fast-sam3d",
+        label="Fast-SAM3D",
+        default_steps=0,
+        description="masked image to GLB · persistent dual T4 worker",
+        input_kind="image",
+        output_kind="artifact",
+    ),
 }
 
 MODEL_ALIASES = {
@@ -46,6 +54,9 @@ MODEL_ALIASES = {
     "z-image-turbo": "z-image-turbo-gguf",
     "tripo": "triposr",
     "tripo-sr": "triposr",
+    "fastsam3d": "fast-sam3d",
+    "fast-sam-3d": "fast-sam3d",
+    "sam3d": "fast-sam3d",
 }
 
 DEFAULT_MODEL = "sana-sprint-1.6b"

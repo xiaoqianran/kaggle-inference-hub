@@ -451,6 +451,80 @@ async def add_triposr_task(
     }
 
 
+@app.post("/task/fast-sam3d", status_code=202)
+async def add_fast_sam3d_task(
+    mask: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    source_url: str = Form(""),
+    seed: int = Form(42),
+    authorization: str | None = Header(None),
+):
+    auth(authorization)
+    source_url = source_url.strip()
+    if (file is None) == (not source_url):
+        raise HTTPException(status_code=400, detail="Provide exactly one of file or source_url")
+
+    mask_data = await mask.read(INPUT_MAX_BYTES + 1)
+    if len(mask_data) > INPUT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Mask image is too large")
+    mask_suffix = image_suffix(mask_data)
+    if mask_suffix is None:
+        raise HTTPException(status_code=400, detail="Mask must be PNG, JPEG, or WebP")
+
+    task_id = state.next_id()
+    input_dir = OUTPUT_DIR / "_inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    owned_input = False
+    if file is not None:
+        data = await file.read(INPUT_MAX_BYTES + 1)
+        if len(data) > INPUT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Input image is too large")
+        suffix = image_suffix(data)
+        if suffix is None:
+            raise HTTPException(status_code=400, detail="Input must be PNG, JPEG, or WebP")
+        input_path = input_dir / f"fast_sam3d_{int(time.time()*1000)}_{task_id:06d}{suffix}"
+        await asyncio.to_thread(input_path.write_bytes, data)
+        source_label = Path(file.filename or f"upload{suffix}").name
+        public_source_url = f"/outputs/_inputs/{input_path.name}"
+        owned_input = True
+    else:
+        input_path = local_output_path(source_url)
+        source_label = input_path.name
+        public_source_url = urlsplit(source_url).path
+
+    mask_path = input_dir / f"fast_sam3d_mask_{int(time.time()*1000)}_{task_id:06d}{mask_suffix}"
+    await asyncio.to_thread(mask_path.write_bytes, mask_data)
+    task = {
+        "id": task_id,
+        "model": "fast-sam3d",
+        "input_url": f"/task/input/{task_id}",
+        "mask_url": f"/task/mask/{task_id}",
+        "source_url": public_source_url,
+        "source_label": source_label,
+        "mask_label": Path(mask.filename or f"mask{mask_suffix}").name,
+        "output_format": "glb",
+        "seed": seed,
+        "created_at": time.time(),
+        "attempt": 0,
+        "_input_path": str(input_path.resolve()),
+        "_mask_path": str(mask_path.resolve()),
+        "_owned_input": owned_input,
+        "_owned_mask": True,
+    }
+    try:
+        state.enqueue(task)
+    except queue.Full:
+        if owned_input:
+            input_path.unlink(missing_ok=True)
+        mask_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail="Task queue is full: fast-sam3d")
+    return {
+        "queued": 1,
+        "queue_size": state.queue_size("fast-sam3d"),
+        "task": {key: value for key, value in task.items() if not key.startswith("_")},
+    }
+
+
 @app.get("/task/next")
 async def next_task(
     model: str = Query(DEFAULT_MODEL),
@@ -485,8 +559,9 @@ async def claim_task(x: ClaimIn, authorization: str | None = Header(None)):
 def task_input(task_id: int, authorization: str | None = Header(None)):
     auth(authorization)
     task = state.lease_task(task_id)
-    if task is None or task.get("model") != "triposr":
-        raise HTTPException(status_code=404, detail="TripoSR task is not inflight")
+    model = str(task.get("model", "")) if task else ""
+    if task is None or model not in MODEL_SPECS or MODEL_SPECS[model].input_kind != "image":
+        raise HTTPException(status_code=404, detail="Image task is not inflight")
     path = Path(task.get("_input_path", ""))
     root = OUTPUT_DIR.resolve()
     try:
@@ -496,6 +571,23 @@ def task_input(task_id: int, authorization: str | None = Header(None)):
     if not resolved.is_relative_to(root) or not resolved.is_file():
         raise HTTPException(status_code=404, detail="Input image does not exist")
     return FileResponse(resolved, filename=task.get("source_label") or resolved.name)
+
+
+@app.get("/task/mask/{task_id}")
+def task_mask(task_id: int, authorization: str | None = Header(None)):
+    auth(authorization)
+    task = state.lease_task(task_id)
+    if task is None or task.get("model") != "fast-sam3d":
+        raise HTTPException(status_code=404, detail="Fast-SAM3D task is not inflight")
+    path = Path(task.get("_mask_path", ""))
+    root = OUTPUT_DIR.resolve()
+    try:
+        resolved = path.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise HTTPException(status_code=404, detail="Mask image does not exist")
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Mask image does not exist")
+    return FileResponse(resolved, filename=task.get("mask_label") or resolved.name)
 
 
 @app.post("/task/fail")
