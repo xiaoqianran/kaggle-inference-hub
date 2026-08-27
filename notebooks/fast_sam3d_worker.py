@@ -14,6 +14,7 @@ import time
 import traceback
 import uuid
 from argparse import Namespace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -24,18 +25,90 @@ import torch
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from PIL import Image
 
-BASE_URL = os.environ["BASE_URL"].rstrip("/") + "/"
-TOKEN = os.environ["KAGGLE_HUB_TOKEN"]
-ROOT = Path(os.getenv("FAST_SAM3D_ROOT", "/kaggle/working/Fast-SAM3D"))
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    base_url: str
+    token: str
+    root: Path
+    checkpoint_dir: Path
+    torch_cache: Path
+    max_input_side: int
+    runtime_mode: str
+    depth_mode: str
+    compile_ss: bool
+    compile_mode: str
+    attention_backend: str
+    stage1_steps: int
+    stage1_distillation: bool
+    stage2_steps: int
+    stage2_distillation: bool
+    worker_count: int
+    warmup_on_start: bool
+
+    @classmethod
+    def from_env(cls) -> RuntimeConfig:
+        root = Path(os.getenv("FAST_SAM3D_ROOT", "/kaggle/working/Fast-SAM3D"))
+        notebook_dir = root / "notebook"
+        return cls(
+            base_url=os.environ["BASE_URL"].rstrip("/") + "/",
+            token=os.environ["KAGGLE_HUB_TOKEN"],
+            root=root,
+            checkpoint_dir=Path(
+                os.getenv(
+                    "FAST_SAM3D_CHECKPOINT_DIR", str(notebook_dir / "checkpoints/hf")
+                )
+            ),
+            torch_cache=Path(
+                os.getenv("FAST_SAM3D_TORCH_CACHE", "/kaggle/working/torch-cache")
+            ),
+            max_input_side=int(os.getenv("FAST_SAM3D_MAX_INPUT_SIDE", "1024")),
+            runtime_mode=os.getenv("FAST_SAM3D_RUNTIME_MODE", "performance")
+            .strip()
+            .lower(),
+            depth_mode=os.getenv("FAST_SAM3D_DEPTH_MODE", "secondary").strip().lower(),
+            compile_ss=_env_bool("FAST_SAM3D_COMPILE_SS", False),
+            compile_mode=os.getenv("FAST_SAM3D_COMPILE_MODE", "max-autotune"),
+            attention_backend=os.getenv("FAST_SAM3D_ATTN_BACKEND", "sdpa")
+            .strip()
+            .lower(),
+            stage1_steps=int(os.getenv("FAST_SAM3D_STAGE1_STEPS", "2")),
+            stage1_distillation=_env_bool("FAST_SAM3D_STAGE1_DISTILLATION", True),
+            stage2_steps=int(os.getenv("FAST_SAM3D_STAGE2_STEPS", "4")),
+            stage2_distillation=_env_bool("FAST_SAM3D_STAGE2_DISTILLATION", True),
+            worker_count=max(1, int(os.getenv("FAST_SAM3D_GPU_COUNT", "1"))),
+            warmup_on_start=_env_bool("FAST_SAM3D_WARMUP_ON_START", False),
+        )
+
+
+CONFIG = RuntimeConfig.from_env()
+if CONFIG.attention_backend not in {
+    "sdpa",
+    "xformers",
+    "flash_attn",
+    "torch_flash_attn",
+}:
+    raise ValueError(f"Unsupported attention backend: {CONFIG.attention_backend}")
+os.environ["ATTN_BACKEND"] = CONFIG.attention_backend
+BASE_URL = CONFIG.base_url
+TOKEN = CONFIG.token
+ROOT = CONFIG.root
 NOTEBOOK_DIR = ROOT / "notebook"
-CHECKPOINT_DIR = Path(os.getenv("FAST_SAM3D_CHECKPOINT_DIR", str(NOTEBOOK_DIR / "checkpoints/hf")))
-TORCH_CACHE = Path(os.getenv("FAST_SAM3D_TORCH_CACHE", "/kaggle/working/torch-cache"))
+CHECKPOINT_DIR = CONFIG.checkpoint_dir
+TORCH_CACHE = CONFIG.torch_cache
+MAX_INPUT_SIDE = CONFIG.max_input_side
 MODEL = "fast-sam3d"
 POLL_TIMEOUT = 35
 REQUEST_TIMEOUT = 180
 HEARTBEAT_SECONDS = 10
 IDLE_DIAGNOSTIC_SECONDS = 60
-MAX_INPUT_SIDE = int(os.getenv("FAST_SAM3D_MAX_INPUT_SIDE", "1024"))
 
 
 def encrypt_blob(data: bytes) -> bytes:
@@ -64,7 +137,9 @@ def checked_response(response: requests.Response, label: str) -> requests.Respon
 
 
 def server_snapshot(session: requests.Session) -> dict[str, Any]:
-    response = session.get(api_url("/api/status"), params={"_ts": time.time_ns()}, timeout=15)
+    response = session.get(
+        api_url("/api/status"), params={"_ts": time.time_ns()}, timeout=15
+    )
     checked_response(response, "GET /api/status")
     return response.json()
 
@@ -72,7 +147,9 @@ def server_snapshot(session: requests.Session) -> dict[str, Any]:
 def preflight_hub() -> str:
     session = requests.Session()
     session.headers.update(auth_headers())
-    response = session.get(api_url("/api/models"), params={"_ts": time.time_ns()}, timeout=20)
+    response = session.get(
+        api_url("/api/models"), params={"_ts": time.time_ns()}, timeout=20
+    )
     checked_response(response, "GET /api/models")
     model_ids = {item.get("id") for item in response.json() if isinstance(item, dict)}
     if MODEL not in model_ids:
@@ -83,10 +160,14 @@ def preflight_hub() -> str:
     )
     snapshot = server_snapshot(session)
     if snapshot.get("storage") != "sqlite":
-        raise RuntimeError("Connected Hub is an old in-memory build. Update/restart Hub first.")
+        raise RuntimeError(
+            "Connected Hub is an old in-memory build. Update/restart Hub first."
+        )
     instance_id = str(snapshot.get("hub_instance_id") or "")
     if not instance_id:
-        raise RuntimeError("Hub did not return hub_instance_id; protocol versions differ")
+        raise RuntimeError(
+            "Hub did not return hub_instance_id; protocol versions differ"
+        )
     queued = int(snapshot.get("queued_by_model", {}).get(MODEL, 0) or 0)
     inflight = int(snapshot.get("inflight_by_model", {}).get(MODEL, 0) or 0)
     print(
@@ -112,7 +193,10 @@ def _rewrite_paths(value: Any) -> Any:
     if isinstance(value, str):
         replacements = {
             "/data3/wmq/Fast-sam3d-objects/checkpoints/torch-cache": str(TORCH_CACHE),
-            "/data3/wmq/Fast-sam3d-objects/checkpoints/": str(NOTEBOOK_DIR / "checkpoints") + "/",
+            "/data3/wmq/Fast-sam3d-objects/checkpoints/": str(
+                NOTEBOOK_DIR / "checkpoints"
+            )
+            + "/",
         }
         for old, new in replacements.items():
             value = value.replace(old, new)
@@ -179,7 +263,6 @@ def _install_low_vram_mode(inference):
     original_pointmap = getattr(pipeline, "compute_pointmap", None)
     original_ss = pipeline.sample_sparse_structure
     original_slat = pipeline.sample_slat
-    original_decode = pipeline.decode_slat
     original_postprocess = pipeline.postprocess_slat_output
 
     depth_model = getattr(pipeline, "depth_model", None)
@@ -188,6 +271,7 @@ def _install_low_vram_mode(inference):
         and depth_model is not None
         and getattr(depth_model, "device", cpu_device).type == "cpu"
     ):
+
         def compute_pointmap_low_vram(*args, **kwargs):
             depth_model.model.to(main_device)
             depth_model.device = main_device
@@ -238,7 +322,10 @@ def _install_low_vram_mode(inference):
                 pipeline.models["slat_decoder_mesh"].map = map_tokens
                 with torch.no_grad():
                     outputs["mesh"] = pipeline.models["slat_decoder_mesh"](slat)
-                print(f"[memory] mesh decode finished in {time.perf_counter() - started:.2f}s", flush=True)
+                print(
+                    f"[memory] mesh decode finished in {time.perf_counter() - started:.2f}s",
+                    flush=True,
+                )
             finally:
                 move_model("slat_decoder_mesh", cpu_device)
                 cleanup("mesh decoder offloaded")
@@ -250,7 +337,10 @@ def _install_low_vram_mode(inference):
                 started = time.perf_counter()
                 with torch.no_grad():
                     outputs["gaussian"] = pipeline.models["slat_decoder_gs"](slat)
-                print(f"[memory] gaussian decode finished in {time.perf_counter() - started:.2f}s", flush=True)
+                print(
+                    f"[memory] gaussian decode finished in {time.perf_counter() - started:.2f}s",
+                    flush=True,
+                )
             finally:
                 move_model("slat_decoder_gs", cpu_device)
                 cleanup("gaussian decoder offloaded")
@@ -290,8 +380,6 @@ def _install_low_vram_mode(inference):
     return inference
 
 
-
-
 def _move_tree_to_device(value: Any, device: torch.device) -> Any:
     if torch.is_tensor(value):
         return value.to(device, non_blocking=True)
@@ -308,16 +396,22 @@ def _move_tree_to_device(value: Any, device: torch.device) -> Any:
 
 def _install_dual_t4_performance_mode(inference):
     if torch.cuda.device_count() < 2:
-        print("[perf] <2 GPUs visible; falling back to staged low-VRAM mode", flush=True)
+        print(
+            "[perf] <2 GPUs visible; falling back to staged low-VRAM mode", flush=True
+        )
         return _install_low_vram_mode(inference)
 
     pipeline = inference._pipeline
     gpu0 = torch.device(f"cuda:{torch.cuda.current_device()}")
-    gpu1 = torch.device(f"cuda:{(torch.cuda.current_device() + 1) % torch.cuda.device_count()}")
+    gpu1 = torch.device(
+        f"cuda:{(torch.cuda.current_device() + 1) % torch.cuda.device_count()}"
+    )
     cpu = torch.device("cpu")
 
     def move_model(name: str, device: torch.device) -> None:
-        module = pipeline.models[name] if name in pipeline.models else None
+        if name not in pipeline.models:
+            return
+        module = pipeline.models[name]
         if module is not None:
             module.to(device)
 
@@ -334,10 +428,10 @@ def _install_dual_t4_performance_mode(inference):
         rows = []
         for idx in range(torch.cuda.device_count()):
             with torch.cuda.device(idx):
-                free, total = torch.cuda.mem_get_info()
+                free, _ = torch.cuda.mem_get_info()
                 rows.append(
-                    f"gpu{idx}:free={free/2**30:.2f}GiB alloc={torch.cuda.memory_allocated(idx)/2**30:.2f}GiB "
-                    f"reserved={torch.cuda.memory_reserved(idx)/2**30:.2f}GiB"
+                    f"gpu{idx}:free={free / 2**30:.2f}GiB alloc={torch.cuda.memory_allocated(idx) / 2**30:.2f}GiB "
+                    f"reserved={torch.cuda.memory_reserved(idx) / 2**30:.2f}GiB"
                 )
         print(f"[perf-memory] {label} | " + " | ".join(rows), flush=True)
 
@@ -388,13 +482,18 @@ def _install_dual_t4_performance_mode(inference):
     original_postprocess = pipeline.postprocess_slat_output
 
     if original_pointmap is not None:
+
         def compute_pointmap_perf(*args, **kwargs):
             sync_all()
             started = time.perf_counter()
             result = original_pointmap(*args, **kwargs)
             sync_all()
-            print(f"[PERF_STAGE] pointmap={time.perf_counter()-started:.3f}s", flush=True)
+            print(
+                f"[PERF_STAGE] pointmap={time.perf_counter() - started:.3f}s",
+                flush=True,
+            )
             return result
+
         pipeline.compute_pointmap = compute_pointmap_perf
 
     def sample_ss_perf(*args, **kwargs):
@@ -403,7 +502,7 @@ def _install_dual_t4_performance_mode(inference):
         with torch.cuda.device(gpu0):
             result = original_ss(*args, **kwargs)
         sync_all()
-        print(f"[PERF_STAGE] ss_total={time.perf_counter()-started:.3f}s", flush=True)
+        print(f"[PERF_STAGE] ss_total={time.perf_counter() - started:.3f}s", flush=True)
         return result
 
     def sample_slat_dual(slat_input, coords, *args, **kwargs):
@@ -411,11 +510,15 @@ def _install_dual_t4_performance_mode(inference):
         started = time.perf_counter()
         slat_input = _move_tree_to_device(slat_input, gpu1)
         kwargs["map_tokens"] = _move_tree_to_device(kwargs.get("map_tokens"), gpu1)
-        kwargs["coords_scores"] = _move_tree_to_device(kwargs.get("coords_scores"), gpu1)
+        kwargs["coords_scores"] = _move_tree_to_device(
+            kwargs.get("coords_scores"), gpu1
+        )
         with torch.cuda.device(gpu1):
             result = original_slat(slat_input, coords, *args, **kwargs)
         sync_all()
-        print(f"[PERF_STAGE] slat_total={time.perf_counter()-started:.3f}s", flush=True)
+        print(
+            f"[PERF_STAGE] slat_total={time.perf_counter() - started:.3f}s", flush=True
+        )
         return result
 
     def decode_mesh_only(map_tokens, slat, formats=None):
@@ -431,7 +534,10 @@ def _install_dual_t4_performance_mode(inference):
             mesh = mesh_decoder(slat)
         sync_all()
         elapsed = time.perf_counter() - started
-        print(f"[PERF_STAGE] mesh_decode={elapsed:.3f}s | gaussian_decode=SKIPPED", flush=True)
+        print(
+            f"[PERF_STAGE] mesh_decode={elapsed:.3f}s | gaussian_decode=SKIPPED",
+            flush=True,
+        )
         # PointMap pipeline currently assumes a gaussian entry for statistics/postprocess.
         # A zero-length placeholder is safe because to_glb() does not read app_rep when
         # texture baking is disabled; mesh vertex_attrs provide the exported colors.
@@ -443,11 +549,14 @@ def _install_dual_t4_performance_mode(inference):
         started = time.perf_counter()
         result = original_postprocess(*args, **kwargs)
         sync_all()
-        print(f"[PERF_STAGE] glb_postprocess={time.perf_counter()-started:.3f}s", flush=True)
+        print(
+            f"[PERF_STAGE] glb_postprocess={time.perf_counter() - started:.3f}s",
+            flush=True,
+        )
         return result
 
-    if os.getenv("FAST_SAM3D_COMPILE_SS", "0") == "1":
-        compile_mode = os.getenv("FAST_SAM3D_COMPILE_MODE", "max-autotune")
+    if CONFIG.compile_ss:
+        compile_mode = CONFIG.compile_mode
         print(f"[perf] compiling SS core mode={compile_mode}", flush=True)
         ss_generator = pipeline.models["ss_generator"]
         ss_decoder = pipeline.models["ss_decoder"]
@@ -475,6 +584,7 @@ def _install_dual_t4_performance_mode(inference):
     )
     return inference
 
+
 def build_inference(enable_acceleration: bool = True):
     os.environ.setdefault("CONDA_PREFIX", "/opt/conda")
     os.environ["TORCH_HOME"] = str(TORCH_CACHE)
@@ -483,8 +593,8 @@ def build_inference(enable_acceleration: bool = True):
     sys.path.insert(0, str(ROOT))
     os.chdir(NOTEBOOK_DIR)
 
-    from omegaconf import OmegaConf
     from inference import Inference
+    from omegaconf import OmegaConf
 
     config = OmegaConf.load(CHECKPOINT_DIR / "pipeline.yaml")
     plain = OmegaConf.to_container(config, resolve=False)
@@ -492,14 +602,20 @@ def build_inference(enable_acceleration: bool = True):
     config.workspace_dir = str(CHECKPOINT_DIR)
     main_gpu = torch.cuda.current_device()
     config.device = f"cuda:{main_gpu}"
-    depth_mode = os.getenv("FAST_SAM3D_DEPTH_MODE", "secondary").strip().lower()
+    depth_mode = CONFIG.depth_mode
     if depth_mode == "staged-main":
         config.depth_model.device = "cpu"
-        print(f"[memory] main pipeline=cuda:{main_gpu} | MoGe=CPU idle, staged onto cuda:{main_gpu}", flush=True)
+        print(
+            f"[memory] main pipeline=cuda:{main_gpu} | MoGe=CPU idle, staged onto cuda:{main_gpu}",
+            flush=True,
+        )
     elif torch.cuda.device_count() > 1:
         depth_gpu = (main_gpu + 1) % torch.cuda.device_count()
         config.depth_model.device = f"cuda:{depth_gpu}"
-        print(f"[memory] main pipeline=cuda:{main_gpu} | MoGe depth=cuda:{depth_gpu}", flush=True)
+        print(
+            f"[memory] main pipeline=cuda:{main_gpu} | MoGe depth=cuda:{depth_gpu}",
+            flush=True,
+        )
     else:
         config.depth_model.device = f"cuda:{main_gpu}"
         print(f"[memory] single GPU resident MoGe mode cuda:{main_gpu}", flush=True)
@@ -511,7 +627,7 @@ def build_inference(enable_acceleration: bool = True):
     inference = Inference(config, compile=False, args=args)
     if hasattr(inference, "get_params"):
         inference.get_params(args)
-    runtime_mode = os.getenv("FAST_SAM3D_RUNTIME_MODE", "performance").strip().lower()
+    runtime_mode = CONFIG.runtime_mode
     if runtime_mode == "performance":
         return _install_dual_t4_performance_mode(inference)
     return _install_low_vram_mode(inference)
@@ -523,11 +639,19 @@ def prepare_inputs(image_raw: bytes, mask_raw: bytes, directory: Path):
     image = Image.open(io.BytesIO(image_raw)).convert("RGB")
     mask_image = Image.open(io.BytesIO(mask_raw)).convert("L")
     if mask_image.size != image.size:
-        raise ValueError(f"Mask size {mask_image.size} must match image size {image.size}")
+        raise ValueError(
+            f"Mask size {mask_image.size} must match image size {image.size}"
+        )
     if MAX_INPUT_SIDE > 0 and max(image.size) > MAX_INPUT_SIDE:
         scale = MAX_INPUT_SIDE / max(image.size)
-        resized = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
-        print(f"[input] resize {image.size[0]}x{image.size[1]} -> {resized[0]}x{resized[1]}", flush=True)
+        resized = (
+            max(1, round(image.width * scale)),
+            max(1, round(image.height * scale)),
+        )
+        print(
+            f"[input] resize {image.size[0]}x{image.size[1]} -> {resized[0]}x{resized[1]}",
+            flush=True,
+        )
         image = image.resize(resized, Image.Resampling.LANCZOS)
         mask_image = mask_image.resize(resized, Image.Resampling.NEAREST)
     mask_path = directory / "mask.png"
@@ -569,11 +693,13 @@ def heartbeat_loop(
                 },
                 timeout=15,
             ).raise_for_status()
-        except Exception as exc:
+        except requests.RequestException as exc:
             print(f"[GPU{gpu}] heartbeat: {type(exc).__name__}: {exc}", flush=True)
 
 
-def report_failure(session: requests.Session, task_id: int, exc: BaseException, gpu: int) -> None:
+def report_failure(
+    session: requests.Session, task_id: int, exc: BaseException, gpu: int
+) -> None:
     message = f"{type(exc).__name__}: {exc}"
     print(f"[GPU{gpu}] FAIL #{task_id}: {message}", flush=True)
     try:
@@ -582,22 +708,21 @@ def report_failure(session: requests.Session, task_id: int, exc: BaseException, 
             json={"id": task_id, "error": message[:1900], "requeue": True},
             timeout=20,
         ).raise_for_status()
-    except Exception as report_exc:
+    except requests.RequestException as report_exc:
         print(f"[GPU{gpu}] fail-report error: {report_exc}", flush=True)
-
 
 
 def run_model(inference, image, mask, seed: int):
     """Run the same inference path for benchmark and persistent worker."""
-    runtime_mode = os.getenv("FAST_SAM3D_RUNTIME_MODE", "performance").strip().lower()
+    runtime_mode = CONFIG.runtime_mode
     if runtime_mode != "performance":
         return inference(image, mask, seed=seed)
 
     rgba = inference.merge_mask_to_rgba(image, mask)
-    stage1_steps = int(os.getenv("FAST_SAM3D_STAGE1_STEPS", "2"))
-    use_stage1_distillation = os.getenv("FAST_SAM3D_STAGE1_DISTILLATION", "1") != "0"
-    stage2_steps = int(os.getenv("FAST_SAM3D_STAGE2_STEPS", "4"))
-    use_stage2_distillation = os.getenv("FAST_SAM3D_STAGE2_DISTILLATION", "1") != "0"
+    stage1_steps = CONFIG.stage1_steps
+    use_stage1_distillation = CONFIG.stage1_distillation
+    stage2_steps = CONFIG.stage2_steps
+    use_stage2_distillation = CONFIG.stage2_distillation
     print(
         f"[perf] run_model stage1_steps={stage1_steps} distill1={use_stage1_distillation} "
         f"stage2_steps={stage2_steps} distill2={use_stage2_distillation} layout=off gaussian=off",
@@ -620,6 +745,35 @@ def run_model(inference, image, mask, seed: int):
         decode_formats=["mesh"],
     )
 
+
+def warmup_inference(inference: Any) -> None:
+    sample_dir = NOTEBOOK_DIR / "images/shutterstock_stylish_kidsroom_1640806567"
+    image_path = sample_dir / "image.png"
+    mask_path = sample_dir / "14.png"
+    if not image_path.is_file() or not mask_path.is_file():
+        raise FileNotFoundError(f"Fast-SAM3D warmup sample is missing: {sample_dir}")
+
+    print("[warmup] begin", flush=True)
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="fastsam3d-startup-warmup-") as tmp:
+        image, mask, hfer = prepare_inputs(
+            image_path.read_bytes(),
+            mask_path.read_bytes(),
+            Path(tmp),
+        )
+        if hasattr(inference, "get_hfer"):
+            inference.get_hfer(hfer)
+        with torch.inference_mode():
+            output = run_model(inference, image, mask, seed=7)
+        del output, image, mask, hfer
+
+    for index in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(index)
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"[warmup] ready in {time.perf_counter() - started:.2f}s", flush=True)
+
+
 def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
     torch.cuda.set_device(gpu)
     gpu_name = torch.cuda.get_device_name(gpu)
@@ -628,7 +782,9 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
     print(f"[GPU{gpu}] loading Fast-SAM3D on {gpu_name} ...", flush=True)
     started = time.perf_counter()
     inference = build_inference(enable_acceleration=True)
-    print(f"[GPU{gpu}] READY in {time.perf_counter()-started:.2f}s", flush=True)
+    if CONFIG.warmup_on_start:
+        warmup_inference(inference)
+    print(f"[GPU{gpu}] READY in {time.perf_counter() - started:.2f}s", flush=True)
 
     session = requests.Session()
     session.headers.update(auth_headers())
@@ -688,8 +844,12 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
                     if now - last_idle_diagnostic >= IDLE_DIAGNOSTIC_SECONDS:
                         last_idle_diagnostic = now
                         snapshot = server_snapshot(session)
-                        queued = int(snapshot.get("queued_by_model", {}).get(MODEL, 0) or 0)
-                        inflight = int(snapshot.get("inflight_by_model", {}).get(MODEL, 0) or 0)
+                        queued = int(
+                            snapshot.get("queued_by_model", {}).get(MODEL, 0) or 0
+                        )
+                        inflight = int(
+                            snapshot.get("inflight_by_model", {}).get(MODEL, 0) or 0
+                        )
                         print(
                             f"[GPU{gpu}] idle | Hub {MODEL} queued={queued} inflight={inflight} "
                             f"instance={str(snapshot.get('hub_instance_id', ''))[:12]}",
@@ -713,9 +873,13 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
                 mask_response.raise_for_status()
                 t_download = time.perf_counter()
 
-                with tempfile.TemporaryDirectory(prefix=f"fastsam3d-{task_id}-") as temp_dir:
+                with tempfile.TemporaryDirectory(
+                    prefix=f"fastsam3d-{task_id}-"
+                ) as temp_dir:
                     temp = Path(temp_dir)
-                    image, mask, hfer = prepare_inputs(image_response.content, mask_response.content, temp)
+                    image, mask, hfer = prepare_inputs(
+                        image_response.content, mask_response.content, temp
+                    )
                     t_pre = time.perf_counter()
 
                     if hasattr(inference, "get_hfer"):
@@ -754,9 +918,9 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
 
                 print(
                     f"[GPU{gpu}] ✓ #{task_id} total={elapsed:.2f}s "
-                    f"download={t_download-t0:.2f}s preprocess={t_pre-t_download:.2f}s "
-                    f"model={t_model-t_pre:.2f}s export={t_export-t_model:.2f}s "
-                    f"upload={t_upload-t_export:.2f}s",
+                    f"download={t_download - t0:.2f}s preprocess={t_pre - t_download:.2f}s "
+                    f"model={t_model - t_pre:.2f}s export={t_export - t_model:.2f}s "
+                    f"upload={t_upload - t_export:.2f}s",
                     flush=True,
                 )
 
@@ -766,12 +930,15 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
 
             except KeyboardInterrupt:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate task failures from the persistent worker
                 if task is not None and "id" in task:
                     report_failure(session, int(task["id"]), exc, gpu)
                     active_task["id"] = None
                 else:
-                    print(f"[GPU{gpu}] poll error: {type(exc).__name__}: {exc}", flush=True)
+                    print(
+                        f"[GPU{gpu}] poll error: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
                     time.sleep(2)
                 traceback.print_exc()
     except KeyboardInterrupt:
@@ -788,16 +955,21 @@ def main() -> None:
     gpu_count = torch.cuda.device_count()
     if gpu_count < 1:
         raise RuntimeError("No CUDA GPU found")
-    wanted = int(os.getenv("FAST_SAM3D_GPU_COUNT", "1"))
-    gpu_count = min(gpu_count, max(1, wanted))
+    gpu_count = min(gpu_count, CONFIG.worker_count)
     run_id = f"{socket.gethostname()[:8]}-{uuid.uuid4().hex[:6]}"
 
-    print(f"Fast-SAM3D persistent worker | GPUs={gpu_count} | base={BASE_URL}", flush=True)
+    print(
+        f"Fast-SAM3D persistent worker | GPUs={gpu_count} | base={BASE_URL}", flush=True
+    )
     hub_instance_id = preflight_hub()
 
     ctx = mp.get_context("spawn")
     processes = [
-        ctx.Process(target=gpu_worker, args=(gpu, run_id, hub_instance_id), name=f"fast-sam3d-gpu{gpu}")
+        ctx.Process(
+            target=gpu_worker,
+            args=(gpu, run_id, hub_instance_id),
+            name=f"fast-sam3d-gpu{gpu}",
+        )
         for gpu in range(gpu_count)
     ]
     for process in processes:

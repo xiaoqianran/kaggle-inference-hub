@@ -23,7 +23,7 @@ def main() -> None:
     if len(matches) != 1:
         raise RuntimeError(f"Expected one embedded worker cell, found {len(matches)}")
     source = (
-        'from pathlib import Path\n\n'
+        "from pathlib import Path\n\n"
         'ROOT = Path("/kaggle/working/Fast-SAM3D")\n'
         'WORKER = ROOT / "kaggle_worker.py"\n\n'
         "WORKER_SOURCE = r'''" + worker_source + "'''\n"
@@ -34,8 +34,12 @@ def main() -> None:
     cell["source"] = source.splitlines(keepends=True)
     cell["execution_count"] = None
     cell["outputs"] = []
-    NOTEBOOK.write_text(json.dumps(notebook, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-    print(f"Synced {WORKER.name} -> {NOTEBOOK.name} ({len(worker_source.splitlines())} lines)")
+    NOTEBOOK.write_text(
+        json.dumps(notebook, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
+    )
+    print(
+        f"Synced {WORKER.name} -> {NOTEBOOK.name} ({len(worker_source.splitlines())} lines)"
+    )
 
 
 if __name__ == "__main__":
