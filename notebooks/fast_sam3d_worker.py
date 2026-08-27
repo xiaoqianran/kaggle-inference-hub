@@ -35,6 +35,7 @@ POLL_TIMEOUT = 35
 REQUEST_TIMEOUT = 180
 HEARTBEAT_SECONDS = 10
 IDLE_DIAGNOSTIC_SECONDS = 60
+MAX_INPUT_SIDE = int(os.getenv("FAST_SAM3D_MAX_INPUT_SIDE", "1024"))
 
 
 def encrypt_blob(data: bytes) -> bytes:
@@ -129,9 +130,9 @@ def inference_args(enable_acceleration: bool = True) -> Namespace:
         ss_warmup=2,
         ss_order=1,
         ss_momentum_beta=0.5,
-        slat_thresh=0.5,
+        slat_thresh=1.5,
         slat_warmup=2,
-        slat_token_ratio=0.15,
+        slat_token_ratio=0.10,
         mesh_spectral_threshold_low=0.5,
         mesh_spectral_threshold_high=0.7,
         enable_ss_faster=enable_acceleration,
@@ -142,6 +143,337 @@ def inference_args(enable_acceleration: bool = True) -> Namespace:
         enable_easy=False,
     )
 
+
+def _install_low_vram_mode(inference):
+    pipeline = inference._pipeline
+    main_device = pipeline.device
+    cpu_device = torch.device("cpu")
+
+    def move_model(name: str, device: torch.device) -> None:
+        if name not in pipeline.models:
+            return
+        module = pipeline.models[name]
+        if module is not None:
+            module.to(device)
+
+    def move_condition(name: str, device: torch.device) -> None:
+        module = pipeline.condition_embedders.get(name)
+        if module is not None and hasattr(module, "to"):
+            module.to(device)
+
+    def cleanup(label: str) -> None:
+        gc.collect()
+        if main_device.type == "cuda":
+            with torch.cuda.device(main_device):
+                torch.cuda.empty_cache()
+                free, total = torch.cuda.mem_get_info()
+                allocated = torch.cuda.memory_allocated()
+                reserved = torch.cuda.memory_reserved()
+            print(
+                f"[memory] {label} | free={free / 2**30:.2f}GiB/"
+                f"{total / 2**30:.2f}GiB alloc={allocated / 2**30:.2f}GiB "
+                f"reserved={reserved / 2**30:.2f}GiB",
+                flush=True,
+            )
+
+    original_pointmap = getattr(pipeline, "compute_pointmap", None)
+    original_ss = pipeline.sample_sparse_structure
+    original_slat = pipeline.sample_slat
+    original_decode = pipeline.decode_slat
+    original_postprocess = pipeline.postprocess_slat_output
+
+    depth_model = getattr(pipeline, "depth_model", None)
+    if (
+        original_pointmap is not None
+        and depth_model is not None
+        and getattr(depth_model, "device", cpu_device).type == "cpu"
+    ):
+        def compute_pointmap_low_vram(*args, **kwargs):
+            depth_model.model.to(main_device)
+            depth_model.device = main_device
+            cleanup("MoGe loaded")
+            try:
+                return original_pointmap(*args, **kwargs)
+            finally:
+                depth_model.model.to(cpu_device)
+                depth_model.device = cpu_device
+                cleanup("MoGe offloaded")
+
+        pipeline.compute_pointmap = compute_pointmap_low_vram
+        print("[memory] MoGe staged on main GPU only during pointmap", flush=True)
+
+    def sample_sparse_structure_low_vram(*args, **kwargs):
+        move_model("ss_generator", main_device)
+        move_model("ss_decoder", main_device)
+        move_condition("ss_condition_embedder", main_device)
+        cleanup("SS loaded")
+        try:
+            return original_ss(*args, **kwargs)
+        finally:
+            move_model("ss_generator", cpu_device)
+            move_model("ss_decoder", cpu_device)
+            move_condition("ss_condition_embedder", cpu_device)
+            cleanup("SS offloaded")
+
+    def sample_slat_low_vram(*args, **kwargs):
+        move_model("slat_generator", main_device)
+        move_condition("slat_condition_embedder", main_device)
+        cleanup("SLaT loaded")
+        try:
+            return original_slat(*args, **kwargs)
+        finally:
+            move_model("slat_generator", cpu_device)
+            move_condition("slat_condition_embedder", cpu_device)
+            cleanup("SLaT offloaded")
+
+    def decode_slat_low_vram(map_tokens, slat, formats=None):
+        requested = list(pipeline.decode_formats if formats is None else formats)
+        outputs = {}
+
+        if "mesh" in requested:
+            move_model("slat_decoder_mesh", main_device)
+            cleanup("mesh decoder loaded")
+            try:
+                started = time.perf_counter()
+                pipeline.models["slat_decoder_mesh"].map = map_tokens
+                with torch.no_grad():
+                    outputs["mesh"] = pipeline.models["slat_decoder_mesh"](slat)
+                print(f"[memory] mesh decode finished in {time.perf_counter() - started:.2f}s", flush=True)
+            finally:
+                move_model("slat_decoder_mesh", cpu_device)
+                cleanup("mesh decoder offloaded")
+
+        if "gaussian" in requested:
+            move_model("slat_decoder_gs", main_device)
+            cleanup("gaussian decoder loaded")
+            try:
+                started = time.perf_counter()
+                with torch.no_grad():
+                    outputs["gaussian"] = pipeline.models["slat_decoder_gs"](slat)
+                print(f"[memory] gaussian decode finished in {time.perf_counter() - started:.2f}s", flush=True)
+            finally:
+                move_model("slat_decoder_gs", cpu_device)
+                cleanup("gaussian decoder offloaded")
+
+        if "gaussian_4" in requested:
+            move_model("slat_decoder_gs_4", main_device)
+            cleanup("gaussian_4 decoder loaded")
+            try:
+                with torch.no_grad():
+                    outputs["gaussian_4"] = pipeline.models["slat_decoder_gs_4"](slat)
+            finally:
+                move_model("slat_decoder_gs_4", cpu_device)
+                cleanup("gaussian_4 decoder offloaded")
+
+        return outputs
+
+    def postprocess_low_vram(*args, **kwargs):
+        try:
+            return original_postprocess(*args, **kwargs)
+        finally:
+            move_model("slat_decoder_mesh", cpu_device)
+            move_model("slat_decoder_gs", cpu_device)
+            move_model("slat_decoder_gs_4", cpu_device)
+            cleanup("decoders offloaded")
+
+    pipeline.sample_sparse_structure = sample_sparse_structure_low_vram
+    pipeline.sample_slat = sample_slat_low_vram
+    pipeline.decode_slat = decode_slat_low_vram
+    pipeline.postprocess_slat_output = postprocess_low_vram
+
+    for name in list(pipeline.models.keys()):
+        move_model(name, cpu_device)
+    for name in list(pipeline.condition_embedders.keys()):
+        move_condition(name, cpu_device)
+    cleanup("low-vram idle")
+    print("[memory] staged low-VRAM mode enabled", flush=True)
+    return inference
+
+
+
+
+def _move_tree_to_device(value: Any, device: torch.device) -> Any:
+    if torch.is_tensor(value):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {k: _move_tree_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_tree_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_tree_to_device(v, device) for v in value)
+    if hasattr(value, "to") and value.__class__.__name__ == "SparseTensor":
+        return value.to(device)
+    return value
+
+
+def _install_dual_t4_performance_mode(inference):
+    if torch.cuda.device_count() < 2:
+        print("[perf] <2 GPUs visible; falling back to staged low-VRAM mode", flush=True)
+        return _install_low_vram_mode(inference)
+
+    pipeline = inference._pipeline
+    gpu0 = torch.device(f"cuda:{torch.cuda.current_device()}")
+    gpu1 = torch.device(f"cuda:{(torch.cuda.current_device() + 1) % torch.cuda.device_count()}")
+    cpu = torch.device("cpu")
+
+    def move_model(name: str, device: torch.device) -> None:
+        module = pipeline.models[name] if name in pipeline.models else None
+        if module is not None:
+            module.to(device)
+
+    def move_condition(name: str, device: torch.device) -> None:
+        module = pipeline.condition_embedders.get(name)
+        if module is not None and hasattr(module, "to"):
+            module.to(device)
+
+    def sync_all() -> None:
+        for idx in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(idx)
+
+    def report(label: str) -> None:
+        rows = []
+        for idx in range(torch.cuda.device_count()):
+            with torch.cuda.device(idx):
+                free, total = torch.cuda.mem_get_info()
+                rows.append(
+                    f"gpu{idx}:free={free/2**30:.2f}GiB alloc={torch.cuda.memory_allocated(idx)/2**30:.2f}GiB "
+                    f"reserved={torch.cuda.memory_reserved(idx)/2**30:.2f}GiB"
+                )
+        print(f"[perf-memory] {label} | " + " | ".join(rows), flush=True)
+
+    # One-time placement. No model CPU<->GPU transfer occurs per request.
+    for name in list(pipeline.models.keys()):
+        move_model(name, cpu)
+    for name in list(pipeline.condition_embedders.keys()):
+        move_condition(name, cpu)
+    gc.collect()
+    for idx in range(torch.cuda.device_count()):
+        with torch.cuda.device(idx):
+            torch.cuda.empty_cache()
+
+    # GPU0: sparse structure only.
+    for name in ("ss_generator", "ss_decoder"):
+        move_model(name, gpu0)
+    move_condition("ss_condition_embedder", gpu0)
+
+    # GPU1: pointmap + SLaT + mesh decoding. Gaussian decoders remain on CPU because
+    # worker GLB export uses vertex colors from mesh when texture baking is disabled.
+    for name in ("slat_generator", "slat_decoder_mesh"):
+        move_model(name, gpu1)
+    move_condition("slat_condition_embedder", gpu1)
+
+    # slat_decoder_mesh contains SparseFeatures2Mesh, which is NOT an nn.Module.
+    # Recreate its geometry/FlexiCubes lookup state on GPU1; nn.Module.to() cannot move it.
+    mesh_decoder = pipeline.models["slat_decoder_mesh"]
+    old_extractor = mesh_decoder.mesh_extractor
+    mesh_decoder.mesh_extractor = old_extractor.__class__(
+        device=str(gpu1),
+        res=old_extractor.res,
+        use_color=old_extractor.use_color,
+    )
+    print(f"[perf] mesh extractor rebuilt on {gpu1}", flush=True)
+
+    depth_model = getattr(pipeline, "depth_model", None)
+    if depth_model is not None and getattr(depth_model, "device", gpu1) != gpu1:
+        depth_model.model.to(gpu1)
+        depth_model.device = gpu1
+
+    # Single-object worker does not need layout refinement after reconstruction.
+    if hasattr(pipeline, "layout_post_optimization_method"):
+        pipeline.layout_post_optimization_method = None
+
+    original_pointmap = getattr(pipeline, "compute_pointmap", None)
+    original_ss = pipeline.sample_sparse_structure
+    original_slat = pipeline.sample_slat
+    original_postprocess = pipeline.postprocess_slat_output
+
+    if original_pointmap is not None:
+        def compute_pointmap_perf(*args, **kwargs):
+            sync_all()
+            started = time.perf_counter()
+            result = original_pointmap(*args, **kwargs)
+            sync_all()
+            print(f"[PERF_STAGE] pointmap={time.perf_counter()-started:.3f}s", flush=True)
+            return result
+        pipeline.compute_pointmap = compute_pointmap_perf
+
+    def sample_ss_perf(*args, **kwargs):
+        sync_all()
+        started = time.perf_counter()
+        with torch.cuda.device(gpu0):
+            result = original_ss(*args, **kwargs)
+        sync_all()
+        print(f"[PERF_STAGE] ss_total={time.perf_counter()-started:.3f}s", flush=True)
+        return result
+
+    def sample_slat_dual(slat_input, coords, *args, **kwargs):
+        sync_all()
+        started = time.perf_counter()
+        slat_input = _move_tree_to_device(slat_input, gpu1)
+        kwargs["map_tokens"] = _move_tree_to_device(kwargs.get("map_tokens"), gpu1)
+        kwargs["coords_scores"] = _move_tree_to_device(kwargs.get("coords_scores"), gpu1)
+        with torch.cuda.device(gpu1):
+            result = original_slat(slat_input, coords, *args, **kwargs)
+        sync_all()
+        print(f"[PERF_STAGE] slat_total={time.perf_counter()-started:.3f}s", flush=True)
+        return result
+
+    def decode_mesh_only(map_tokens, slat, formats=None):
+        # The standard worker disables texture baking and uses mesh.vertex_attrs for color,
+        # so Gaussian appearance is not consumed by to_glb(). Skip that decoder completely.
+        sync_all()
+        started = time.perf_counter()
+        map_tokens = _move_tree_to_device(map_tokens, gpu1)
+        slat = _move_tree_to_device(slat, gpu1)
+        with torch.cuda.device(gpu1), torch.no_grad():
+            mesh_decoder = pipeline.models["slat_decoder_mesh"]
+            mesh_decoder.map = map_tokens
+            mesh = mesh_decoder(slat)
+        sync_all()
+        elapsed = time.perf_counter() - started
+        print(f"[PERF_STAGE] mesh_decode={elapsed:.3f}s | gaussian_decode=SKIPPED", flush=True)
+        # PointMap pipeline currently assumes a gaussian entry for statistics/postprocess.
+        # A zero-length placeholder is safe because to_glb() does not read app_rep when
+        # texture baking is disabled; mesh vertex_attrs provide the exported colors.
+        dummy_gaussian = Namespace(_xyz=torch.empty((0, 3)))
+        return {"mesh": mesh, "gaussian": [dummy_gaussian]}
+
+    def postprocess_perf(*args, **kwargs):
+        sync_all()
+        started = time.perf_counter()
+        result = original_postprocess(*args, **kwargs)
+        sync_all()
+        print(f"[PERF_STAGE] glb_postprocess={time.perf_counter()-started:.3f}s", flush=True)
+        return result
+
+    if os.getenv("FAST_SAM3D_COMPILE_SS", "0") == "1":
+        compile_mode = os.getenv("FAST_SAM3D_COMPILE_MODE", "max-autotune")
+        print(f"[perf] compiling SS core mode={compile_mode}", flush=True)
+        ss_generator = pipeline.models["ss_generator"]
+        ss_decoder = pipeline.models["ss_decoder"]
+        ss_generator.reverse_fn.inner_forward = torch.compile(
+            ss_generator.reverse_fn.inner_forward,
+            mode=compile_mode,
+            fullgraph=True,
+        )
+        ss_decoder.forward = torch.compile(
+            ss_decoder.forward,
+            mode=compile_mode,
+            fullgraph=True,
+        )
+        print("[perf] SS core compile hooks installed", flush=True)
+
+    pipeline.sample_sparse_structure = sample_ss_perf
+    pipeline.sample_slat = sample_slat_dual
+    pipeline.decode_slat = decode_mesh_only
+    pipeline.postprocess_slat_output = postprocess_perf
+    report("resident split ready")
+    print(
+        f"[perf] dual-T4 resident v2 | GPU0={gpu0}: SS | GPU1={gpu1}: MoGe+SLaT+Mesh | "
+        "Gaussian skipped | no per-request model offload",
+        flush=True,
+    )
+    return inference
 
 def build_inference(enable_acceleration: bool = True):
     os.environ.setdefault("CONDA_PREFIX", "/opt/conda")
@@ -158,6 +490,19 @@ def build_inference(enable_acceleration: bool = True):
     plain = OmegaConf.to_container(config, resolve=False)
     config = OmegaConf.create(_rewrite_paths(plain))
     config.workspace_dir = str(CHECKPOINT_DIR)
+    main_gpu = torch.cuda.current_device()
+    config.device = f"cuda:{main_gpu}"
+    depth_mode = os.getenv("FAST_SAM3D_DEPTH_MODE", "secondary").strip().lower()
+    if depth_mode == "staged-main":
+        config.depth_model.device = "cpu"
+        print(f"[memory] main pipeline=cuda:{main_gpu} | MoGe=CPU idle, staged onto cuda:{main_gpu}", flush=True)
+    elif torch.cuda.device_count() > 1:
+        depth_gpu = (main_gpu + 1) % torch.cuda.device_count()
+        config.depth_model.device = f"cuda:{depth_gpu}"
+        print(f"[memory] main pipeline=cuda:{main_gpu} | MoGe depth=cuda:{depth_gpu}", flush=True)
+    else:
+        config.depth_model.device = f"cuda:{main_gpu}"
+        print(f"[memory] single GPU resident MoGe mode cuda:{main_gpu}", flush=True)
     if enable_acceleration:
         config["ss_generator_config_path"] = "ss_generator_faster.yaml"
         config["slat_generator_config_path"] = "slat_generator_faster.yaml"
@@ -166,7 +511,10 @@ def build_inference(enable_acceleration: bool = True):
     inference = Inference(config, compile=False, args=args)
     if hasattr(inference, "get_params"):
         inference.get_params(args)
-    return inference
+    runtime_mode = os.getenv("FAST_SAM3D_RUNTIME_MODE", "performance").strip().lower()
+    if runtime_mode == "performance":
+        return _install_dual_t4_performance_mode(inference)
+    return _install_low_vram_mode(inference)
 
 
 def prepare_inputs(image_raw: bytes, mask_raw: bytes, directory: Path):
@@ -176,6 +524,12 @@ def prepare_inputs(image_raw: bytes, mask_raw: bytes, directory: Path):
     mask_image = Image.open(io.BytesIO(mask_raw)).convert("L")
     if mask_image.size != image.size:
         raise ValueError(f"Mask size {mask_image.size} must match image size {image.size}")
+    if MAX_INPUT_SIDE > 0 and max(image.size) > MAX_INPUT_SIDE:
+        scale = MAX_INPUT_SIDE / max(image.size)
+        resized = (max(1, round(image.width * scale)), max(1, round(image.height * scale)))
+        print(f"[input] resize {image.size[0]}x{image.size[1]} -> {resized[0]}x{resized[1]}", flush=True)
+        image = image.resize(resized, Image.Resampling.LANCZOS)
+        mask_image = mask_image.resize(resized, Image.Resampling.NEAREST)
     mask_path = directory / "mask.png"
     mask_image.save(mask_path)
     image_array = np.asarray(image, dtype=np.uint8)
@@ -231,6 +585,40 @@ def report_failure(session: requests.Session, task_id: int, exc: BaseException, 
     except Exception as report_exc:
         print(f"[GPU{gpu}] fail-report error: {report_exc}", flush=True)
 
+
+
+def run_model(inference, image, mask, seed: int):
+    """Run the same inference path for benchmark and persistent worker."""
+    runtime_mode = os.getenv("FAST_SAM3D_RUNTIME_MODE", "performance").strip().lower()
+    if runtime_mode != "performance":
+        return inference(image, mask, seed=seed)
+
+    rgba = inference.merge_mask_to_rgba(image, mask)
+    stage1_steps = int(os.getenv("FAST_SAM3D_STAGE1_STEPS", "2"))
+    use_stage1_distillation = os.getenv("FAST_SAM3D_STAGE1_DISTILLATION", "1") != "0"
+    stage2_steps = int(os.getenv("FAST_SAM3D_STAGE2_STEPS", "4"))
+    use_stage2_distillation = os.getenv("FAST_SAM3D_STAGE2_DISTILLATION", "1") != "0"
+    print(
+        f"[perf] run_model stage1_steps={stage1_steps} distill1={use_stage1_distillation} "
+        f"stage2_steps={stage2_steps} distill2={use_stage2_distillation} layout=off gaussian=off",
+        flush=True,
+    )
+    return inference._pipeline.run(
+        rgba,
+        None,
+        seed,
+        stage1_only=False,
+        with_mesh_postprocess=False,
+        with_texture_baking=False,
+        with_layout_postprocess=False,
+        use_vertex_color=True,
+        stage1_inference_steps=stage1_steps,
+        stage2_inference_steps=stage2_steps,
+        use_stage1_distillation=use_stage1_distillation,
+        use_stage2_distillation=use_stage2_distillation,
+        pointmap=None,
+        decode_formats=["mesh"],
+    )
 
 def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
     torch.cuda.set_device(gpu)
@@ -333,7 +721,7 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
                     if hasattr(inference, "get_hfer"):
                         inference.get_hfer(hfer)
                     with torch.inference_mode():
-                        output = inference(image, mask, seed=seed)
+                        output = run_model(inference, image, mask, seed)
                     t_model = time.perf_counter()
 
                     artifact = export_glb(output["glb"], temp / "result.glb")
@@ -400,7 +788,7 @@ def main() -> None:
     gpu_count = torch.cuda.device_count()
     if gpu_count < 1:
         raise RuntimeError("No CUDA GPU found")
-    wanted = int(os.getenv("FAST_SAM3D_GPU_COUNT", str(gpu_count)))
+    wanted = int(os.getenv("FAST_SAM3D_GPU_COUNT", "1"))
     gpu_count = min(gpu_count, max(1, wanted))
     run_id = f"{socket.gethostname()[:8]}-{uuid.uuid4().hex[:6]}"
 
