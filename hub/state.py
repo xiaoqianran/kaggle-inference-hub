@@ -20,6 +20,12 @@ from .config import (
 )
 
 
+class TaskCancelledError(RuntimeError):
+    def __init__(self, task: dict[str, Any]):
+        super().__init__(f"Task {task.get('id')} was cancelled")
+        self.task = task
+
+
 class ClosingConnection(sqlite3.Connection):
     """Commit/rollback like sqlite3.Connection and always release the file handle."""
 
@@ -214,6 +220,9 @@ class HubState:
         requeued = 0
         for row in rows:
             task = self._load(row["payload"])
+            if task.get("_cancel_requested"):
+                connection.execute("DELETE FROM tasks WHERE id = ?", (int(row["id"]),))
+                continue
             error = f"lease expired from worker {row['worker_id']}"
             task["last_error"] = error
             if int(task.get("attempt", 0)) >= MAX_ATTEMPTS:
@@ -321,6 +330,80 @@ class HubState:
             ).fetchone()
         return dict(row) if row else None
 
+    def active_tasks(self, model: str | None = None, limit: int = 300) -> list[dict[str, Any]]:
+        self.requeue_expired()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if model:
+            clauses.append("model = ?")
+            params.append(model)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(limit, 500)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT id, model, status, worker_id, created_at, payload FROM tasks {where} "
+                "ORDER BY id DESC LIMIT ?",
+                params,
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            task = self._load(row["payload"])
+            items.append({
+                "id": int(row["id"]),
+                "model": str(row["model"]),
+                "status": str(row["status"]),
+                "worker_id": row["worker_id"],
+                "created_at": float(row["created_at"]),
+                "source_url": task.get("source_url", ""),
+                "source_label": task.get("source_label", ""),
+                "attempt": int(task.get("attempt", 0)),
+                "cancel_requested": bool(task.get("_cancel_requested")),
+            })
+        return items
+
+    def cancel_task(self, task_id: int) -> tuple[str, dict[str, Any]] | None:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT status, payload FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                task = self._load(row["payload"])
+                if row["status"] == "queued":
+                    connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                    connection.commit()
+                    return "cancelled", task
+                if not task.get("_cancel_requested"):
+                    task["_cancel_requested"] = True
+                    task["_cancel_requested_at"] = now
+                    connection.execute(
+                        "UPDATE tasks SET payload = ? WHERE id = ? AND status = 'inflight'",
+                        (self._dump(task), task_id),
+                    )
+                connection.commit()
+                return "cancel_requested", task
+            except Exception:
+                connection.rollback()
+                raise
+
+    def cancel_requested(self, task_id: int, worker_id: str | None = None) -> bool:
+        with self._connect() as connection:
+            if worker_id is None:
+                row = connection.execute(
+                    "SELECT payload FROM tasks WHERE id = ? AND status = 'inflight'",
+                    (task_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT payload FROM tasks WHERE id = ? AND status = 'inflight' AND worker_id = ?",
+                    (task_id, worker_id),
+                ).fetchone()
+        return bool(row and self._load(row["payload"]).get("_cancel_requested"))
+
     def mask_result(self, task_id: int) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -340,11 +423,16 @@ class HubState:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                exists = connection.execute(
-                    "SELECT 1 FROM tasks WHERE id = ? AND status = 'inflight'", (task_id,)
+                row = connection.execute(
+                    "SELECT payload FROM tasks WHERE id = ? AND status = 'inflight'", (task_id,)
                 ).fetchone()
-                if exists is None:
+                if row is None:
                     raise KeyError(task_id)
+                task = self._load(row["payload"])
+                if task.get("_cancel_requested"):
+                    connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                    connection.commit()
+                    raise TaskCancelledError(task)
                 now = float(item.get("time", time.time()))
                 connection.execute(
                     """
@@ -391,6 +479,10 @@ class HubState:
                     connection.commit()
                     return False, None
                 task = self._load(row["payload"])
+                if task.get("_cancel_requested"):
+                    connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                    connection.commit()
+                    return False, task
                 task["last_error"] = error
                 should_requeue = requeue and int(task.get("attempt", 0)) < MAX_ATTEMPTS
                 if should_requeue:
@@ -484,11 +576,16 @@ class HubState:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                exists = connection.execute(
-                    "SELECT 1 FROM tasks WHERE id = ? AND status = 'inflight'", (task_id,)
+                row = connection.execute(
+                    "SELECT payload FROM tasks WHERE id = ? AND status = 'inflight'", (task_id,)
                 ).fetchone()
-                if exists is None:
+                if row is None:
                     raise KeyError(task_id)
+                task = self._load(row["payload"])
+                if task.get("_cancel_requested"):
+                    connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                    connection.commit()
+                    raise TaskCancelledError(task)
                 cursor = connection.execute(
                     """
                     INSERT INTO history(task_id, model, payload, created_at)

@@ -25,6 +25,7 @@ export function useHubSocket(): ConnectionState {
         setConnection('online')
         void queryClient.invalidateQueries({ queryKey: queryKeys.history })
         void queryClient.invalidateQueries({ queryKey: queryKeys.status })
+        void queryClient.invalidateQueries({ queryKey: queryKeys.activeTasks })
       })
 
       socket.addEventListener('message', (event) => {
@@ -34,6 +35,7 @@ export function useHubSocket(): ConnectionState {
           return [...current, item]
         })
         void queryClient.invalidateQueries({ queryKey: queryKeys.status })
+        void queryClient.invalidateQueries({ queryKey: queryKeys.activeTasks })
       })
 
       socket.addEventListener('close', () => {

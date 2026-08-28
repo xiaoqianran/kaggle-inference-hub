@@ -34,9 +34,9 @@ from .config import (
 )
 from .crypto import decrypt_blob
 from .prompt_pipeline import PromptPipeline, PromptPipelineError, PromptPipelineSettings
-from .state import state
+from .state import TaskCancelledError, state
 
-app = FastAPI(title="Kaggle Inference Hub", version="0.7.0")
+app = FastAPI(title="Kaggle Inference Hub", version="0.8.0")
 MASK_MODEL = "fast-sam3d-mask"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 WEB_DIR = Path(__file__).with_name("web")
@@ -754,6 +754,11 @@ async def upload_masks(
             "time": time.time(),
         }
         state.finish_mask(id, result)
+    except TaskCancelledError as exc:
+        for path in paths:
+            path.unlink(missing_ok=True)
+        cleanup_owned_task_files(exc.task)
+        raise HTTPException(status_code=409, detail="Mask task was cancelled")
     except KeyError:
         for path in paths:
             path.unlink(missing_ok=True)
@@ -928,7 +933,15 @@ def task_fail(x: FailIn, authorization: str | None = Header(None)):
         raise HTTPException(status_code=503, detail="Queue full while requeueing")
     if task is None:
         raise HTTPException(status_code=404, detail="Task is not inflight")
-    return {"id": x.id, "requeued": requeued, "attempt": task.get("attempt", 0)}
+    cancelled = bool(task.get("_cancel_requested"))
+    if cancelled:
+        cleanup_owned_task_files(task)
+    return {
+        "id": x.id,
+        "requeued": requeued,
+        "cancelled": cancelled,
+        "attempt": task.get("attempt", 0),
+    }
 
 
 @app.post("/worker/register")
@@ -949,8 +962,15 @@ def worker_register(x: WorkerIn, authorization: str | None = Header(None)):
 def worker_heartbeat(x: HeartbeatIn, authorization: str | None = Header(None)):
     auth(authorization)
     lease_renewed = False
+    cancel_requested = False
     if x.active_task_id is not None:
-        lease_renewed = state.renew_lease(x.active_task_id, x.worker_id)
+        cancel_requested = state.cancel_requested(x.active_task_id, x.worker_id)
+        # Once cancellation is requested, deliberately stop extending the lease. Older
+        # workers that do not understand cooperative cancellation can finish locally,
+        # but the Hub will retire the task after lease expiry instead of showing
+        # CANCELLING forever. Any eventual upload is still rejected.
+        if not cancel_requested:
+            lease_renewed = state.renew_lease(x.active_task_id, x.worker_id)
     item = state.heartbeat(x.worker_id, {
         "local_queue": x.local_queue,
         "upload_queue": x.upload_queue,
@@ -959,7 +979,38 @@ def worker_heartbeat(x: HeartbeatIn, authorization: str | None = Header(None)):
     })
     if item is None:
         raise HTTPException(status_code=404, detail="Worker not registered")
-    return {**item, "lease_renewed": lease_renewed}
+    return {**item, "lease_renewed": lease_renewed, "cancel_requested": cancel_requested}
+
+
+@app.get("/api/tasks")
+def get_active_tasks(
+    model: str | None = None,
+    limit: int = Query(300, ge=1, le=500),
+    authorization: str | None = Header(None),
+):
+    auth(authorization)
+    canonical = model_or_400(model) if model else None
+    return state.active_tasks(canonical, limit=limit)
+
+
+@app.post("/task/{task_id}/cancel")
+def cancel_task(task_id: int, authorization: str | None = Header(None)):
+    auth(authorization)
+    result = state.cancel_task(task_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Active task not found")
+    disposition, task = result
+    # Clean Hub-owned inputs immediately for both queued and inflight cancellation.
+    # An inflight worker that already fetched its input can finish locally, but Hub will
+    # reject the result; one that has not fetched it yet fails early instead. This also
+    # prevents cancelled leases from leaving orphaned _input files after worker death.
+    cleanup_owned_task_files(task)
+    return {
+        "id": task_id,
+        "model": task.get("model", ""),
+        "status": disposition,
+        "cancel_requested": disposition == "cancel_requested",
+    }
 
 
 @app.get("/api/status")
@@ -1046,6 +1097,10 @@ async def upload_artifact(
     }
     try:
         item = state.finish(id, item)
+    except TaskCancelledError as exc:
+        path.unlink(missing_ok=True)
+        cleanup_owned_task_files(exc.task)
+        raise HTTPException(status_code=409, detail="Task was cancelled")
     except KeyError:
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=409, detail="Task is no longer inflight")
@@ -1108,6 +1163,10 @@ async def upload(
             item["prompt_meta"] = leased_task["prompt_meta"]
     try:
         item = state.finish(id, item)
+    except TaskCancelledError as exc:
+        path.unlink(missing_ok=True)
+        cleanup_owned_task_files(exc.task)
+        raise HTTPException(status_code=409, detail="Task was cancelled")
     except KeyError:
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=409, detail="Task is no longer inflight")

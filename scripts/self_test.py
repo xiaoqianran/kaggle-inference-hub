@@ -173,6 +173,64 @@ def test_http_protocol(directory: Path) -> None:
         status = client.get("/api/status").json()
         assert status["storage"] == "sqlite" and status["inflight"] == 0
 
+        # Active task visibility + cancellation: queued work is removed immediately,
+        # while inflight work is marked and its eventual upload is rejected.
+        queued_cancel = client.post(
+            "/task/triposr",
+            headers=headers,
+            data={"output_format": "glb", "mc_resolution": "256"},
+            files={"file": ("cancel-queued.png", png, "image/png")},
+        )
+        assert queued_cancel.status_code == 202, queued_cancel.text
+        queued_cancel_id = queued_cancel.json()["task"]["id"]
+        active = client.get("/api/tasks?model=triposr", headers=headers)
+        assert active.status_code == 200
+        assert any(item["id"] == queued_cancel_id and item["status"] == "queued" for item in active.json())
+        cancelled = client.post(f"/task/{queued_cancel_id}/cancel", headers=headers)
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelled"
+        assert all(item["id"] != queued_cancel_id for item in client.get("/api/tasks?model=triposr", headers=headers).json())
+
+        inflight_cancel = client.post(
+            "/task/triposr",
+            headers=headers,
+            data={"output_format": "glb", "mc_resolution": "256"},
+            files={"file": ("cancel-inflight.png", png, "image/png")},
+        )
+        assert inflight_cancel.status_code == 202, inflight_cancel.text
+        inflight_cancel_id = inflight_cancel.json()["task"]["id"]
+        inflight_claim = client.post(
+            "/task/claim",
+            headers=headers,
+            json={"model": "triposr", "worker_id": "cancel-http-gpu", "wait_seconds": 0},
+        )
+        assert inflight_claim.status_code == 200 and inflight_claim.json()["id"] == inflight_cancel_id
+        inflight_task = module.state.lease_task(inflight_cancel_id)
+        assert inflight_task is not None
+        inflight_input_path = Path(inflight_task["_input_path"])
+        assert inflight_input_path.is_file()
+        cancel_requested = client.post(f"/task/{inflight_cancel_id}/cancel", headers=headers)
+        assert cancel_requested.status_code == 200
+        assert not inflight_input_path.exists()
+        assert cancel_requested.json()["status"] == "cancel_requested"
+        active_inflight = client.get("/api/tasks?model=triposr", headers=headers).json()
+        assert any(item["id"] == inflight_cancel_id and item["cancel_requested"] for item in active_inflight)
+        cancelled_upload = client.post(
+            "/upload/artifact",
+            headers=headers,
+            data={
+                "id": str(inflight_cancel_id),
+                "gpu": "0",
+                "model": "triposr",
+                "worker_id": "cancel-http-gpu",
+                "output_format": "glb",
+            },
+            files={"file": ("cancelled.glb.bin", encrypted, "application/octet-stream")},
+        )
+        assert cancelled_upload.status_code == 409, cancelled_upload.text
+        assert "cancelled" in cancelled_upload.text.lower()
+        assert all(item["id"] != inflight_cancel_id for item in client.get("/api/tasks?model=triposr", headers=headers).json())
+
         public_models = client.get("/api/models").json()
         assert "fast-sam3d-mask" not in {item["id"] for item in public_models}
 

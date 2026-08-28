@@ -146,6 +146,44 @@ export type MaskTaskStatus = {
   candidates?: MaskCandidate[]
 }
 
+export type ActiveTask = {
+  id: number
+  model: string
+  status: 'queued' | 'inflight'
+  worker_id?: string | null
+  created_at: number
+  source_url?: string
+  source_label?: string
+  attempt: number
+  cancel_requested: boolean
+}
+
+export type CancelTaskResult = {
+  id: number
+  model: string
+  status: 'cancelled' | 'cancel_requested'
+  cancel_requested: boolean
+}
+
+export type ArtifactBatchFailure = {
+  index: number
+  label: string
+  error: string
+}
+
+export type ArtifactBatchSuccess = {
+  index: number
+  task: QueuedTask
+}
+
+export type ArtifactBatchResult = {
+  total: number
+  queued: number
+  tasks: QueuedTask[]
+  successes: ArtifactBatchSuccess[]
+  failures: ArtifactBatchFailure[]
+}
+
 export type Worker = {
   worker_id: string
   model: string

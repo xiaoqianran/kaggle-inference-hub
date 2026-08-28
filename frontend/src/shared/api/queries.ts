@@ -7,6 +7,7 @@ export const queryKeys = {
   promptPipeline: ['prompt-pipeline'] as const,
   status: ['hub-status'] as const,
   history: ['history'] as const,
+  activeTasks: ['active-tasks'] as const,
 }
 
 export const modelsQuery = queryOptions({

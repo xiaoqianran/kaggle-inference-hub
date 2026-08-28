@@ -1,6 +1,8 @@
 import type {
   ArtifactSource,
   ArtifactSubmission,
+  ActiveTask,
+  CancelTaskResult,
   BatchTaskRequest,
   HistoryItem,
   HubStatus,
@@ -66,6 +68,20 @@ export function getHubStatus(): Promise<HubStatus> {
 
 export function getHistory(): Promise<HistoryItem[]> {
   return requestJson('/api/history?limit=300')
+}
+
+export function getActiveTasks(token: string, model?: string): Promise<ActiveTask[]> {
+  const query = model ? `?model=${encodeURIComponent(model)}&limit=300` : '?limit=300'
+  return requestJson(`/api/tasks${query}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+export function cancelTask(token: string, taskId: number): Promise<CancelTaskResult> {
+  return requestJson(`/task/${taskId}/cancel`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
 }
 
 export function processPrompt(token: string, input: PromptProcessRequest): Promise<PromptProcessResult> {
@@ -152,4 +168,22 @@ export async function getMaskCandidate(token: string, path: string): Promise<Blo
     throw new ApiError(text || `HTTP ${response.status}`, response.status)
   }
   return response.blob()
+}
+
+
+export async function createAutoMaskFile(token: string, source: ArtifactSource): Promise<File> {
+  const queued = await queueAutoMask(token, source)
+  const taskId = queued.task.id
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    const status = await getMaskStatus(token, taskId)
+    if (status.status === 'ready') {
+      const candidate = status.candidates?.[0]
+      if (!candidate) throw new Error(`Mask #${taskId} 没有候选结果`)
+      const blob = await getMaskCandidate(token, candidate.url)
+      return new File([blob], `fast-sam3d-mask-${taskId}.png`, { type: 'image/png' })
+    }
+    if (status.status === 'failed') throw new Error(status.error ?? `Mask #${taskId} 失败`)
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+  throw new Error(`Mask #${taskId} 等待超时`)
 }

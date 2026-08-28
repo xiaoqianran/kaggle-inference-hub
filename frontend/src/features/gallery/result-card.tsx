@@ -1,4 +1,4 @@
-import { Box, Clock3, Download, Eye, Maximize2, Sparkles } from 'lucide-react'
+import { Box, Check, Clock3, Download, Eye, Maximize2, Sparkles } from 'lucide-react'
 import { lazy, Suspense, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
@@ -17,6 +17,9 @@ type ResultCardProps = {
   modelLabel: string
   onConvertTo3d?: (sourceUrl: string) => void
   convertModelLabel?: string
+  selectable?: boolean
+  selected?: boolean
+  onSelectedChange?: (selected: boolean) => void
 }
 
 const resultDateFormatter = new Intl.DateTimeFormat('zh-CN', {
@@ -26,7 +29,7 @@ const resultDateFormatter = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
 })
 
-export function ResultCard({ item, modelLabel, onConvertTo3d, convertModelLabel }: ResultCardProps) {
+export function ResultCard({ item, modelLabel, onConvertTo3d, convertModelLabel, selectable = false, selected = false, onSelectedChange }: ResultCardProps) {
   const createdAt = resultDateFormatter.format(new Date(item.time * 1000))
   const [previewOpen, setPreviewOpen] = useState(false)
   const [imagePreviewOpen, setImagePreviewOpen] = useState(false)
@@ -34,7 +37,7 @@ export function ResultCard({ item, modelLabel, onConvertTo3d, convertModelLabel 
   if (item.kind === 'artifact') {
     const format = item.output_format.toUpperCase()
     return (
-      <Card className="result-card group overflow-hidden border-border bg-card py-0 shadow-sm transition hover:-translate-y-0.5 hover:border-primary/45 hover:shadow-lg">
+      <Card className="result-card group relative overflow-hidden border-border bg-card py-0 shadow-sm transition hover:-translate-y-0.5 hover:border-primary/45 hover:shadow-lg">
         <div className="relative aspect-square overflow-hidden bg-[var(--ctp-mantle)]">
           {item.source_url ? (
             <img
@@ -85,7 +88,7 @@ export function ResultCard({ item, modelLabel, onConvertTo3d, convertModelLabel 
   const imageUrl = `${item.url}?t=${item.time}`
 
   return (
-    <Card className="result-card group overflow-hidden border-border bg-card py-0 shadow-sm transition hover:-translate-y-0.5 hover:border-primary/45 hover:shadow-lg">
+    <Card className="result-card group relative overflow-hidden border-border bg-card py-0 shadow-sm transition hover:-translate-y-0.5 hover:border-primary/45 hover:shadow-lg">
       <button
         type="button"
         aria-label="放大查看生成图片"
@@ -103,11 +106,24 @@ export function ResultCard({ item, modelLabel, onConvertTo3d, convertModelLabel 
           <Maximize2 className="size-3.5" />
         </span>
         {item.prompt_meta?.mode ? (
-          <Badge variant="secondary" className="absolute left-3 top-3 gap-1 bg-[var(--ctp-mantle)]/90 text-[9px] backdrop-blur">
+          <Badge variant="secondary" className={`absolute top-3 gap-1 bg-[var(--ctp-mantle)]/90 text-[9px] backdrop-blur ${selectable ? 'left-12' : 'left-3'}`}>
             <Sparkles className="size-3 text-[var(--ctp-yellow)]" /> {item.prompt_meta.mode}
           </Badge>
         ) : null}
       </button>
+      {selectable ? (
+        <button
+          type="button"
+          aria-label={selected ? '取消选择' : '选择图片'}
+          aria-pressed={selected}
+          onClick={() => onSelectedChange?.(!selected)}
+          className={`absolute left-3 top-3 z-20 flex size-8 items-center justify-center rounded-full border shadow-md backdrop-blur transition ${
+            selected ? 'border-primary bg-primary text-primary-foreground' : 'border-white/40 bg-black/55 text-white hover:bg-black/75'
+          }`}
+        >
+          <Check className={`size-4 ${selected ? 'opacity-100' : 'opacity-35'}`} />
+        </button>
+      ) : null}
       <ImagePreviewDialog
         open={imagePreviewOpen}
         onOpenChange={setImagePreviewOpen}

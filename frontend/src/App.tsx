@@ -41,7 +41,7 @@ export default function App() {
   const [selectedArtifactModel, setSelectedArtifactModel] = useState(
     () => localStorage.getItem('kaggle_hub_artifact_model') ?? 'triposr',
   )
-  const [artifactSourceUrl, setArtifactSourceUrl] = useState<string>()
+  const [artifactSourceUrls, setArtifactSourceUrls] = useState<string[]>([])
 
   const models = useQuery(modelsQuery)
   const pipeline = useQuery(promptPipelineQuery)
@@ -79,10 +79,12 @@ export default function App() {
     else if (workspace === 'image') updateImageModel(model)
   }
 
-  const prepareImageTo3d = (sourceUrl: string) => {
-    setArtifactSourceUrl(sourceUrl)
+  const prepareImagesTo3d = (sourceUrls: string[]) => {
+    setArtifactSourceUrls(Array.from(new Set(sourceUrls.filter(Boolean))))
     setWorkspace('3d')
   }
+
+  const prepareImageTo3d = (sourceUrl: string) => prepareImagesTo3d([sourceUrl])
 
   const startupError = models.error ?? pipeline.error ?? status.error ?? history.error
   const imageItems = currentModel
@@ -145,6 +147,7 @@ export default function App() {
               conversionModel={currentArtifactModel}
               onConversionModelChange={updateArtifactModel}
               onConvertTo3d={prepareImageTo3d}
+              onConvertManyTo3d={prepareImagesTo3d}
               isLoading={history.isLoading}
               isRefreshing={history.isFetching}
               onRefresh={() => void history.refetch()}
@@ -159,8 +162,8 @@ export default function App() {
                 model={currentArtifactModel}
                 token={token}
                 status={status.data}
-                sourceUrl={artifactSourceUrl}
-                onSourceUrlClear={() => setArtifactSourceUrl(undefined)}
+                sourceUrls={artifactSourceUrls}
+                onSourceUrlsChange={setArtifactSourceUrls}
               />
             </Suspense>
           </aside>

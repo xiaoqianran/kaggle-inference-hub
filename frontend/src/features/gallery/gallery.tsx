@@ -1,8 +1,9 @@
-import { Box, ChevronLeft, ChevronRight, ImageIcon, RefreshCw } from 'lucide-react'
+import { Box, CheckSquare2, ChevronLeft, ChevronRight, ImageIcon, RefreshCw, Send, X } from 'lucide-react'
 import { useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { ResultCard, ResultCardSkeleton } from '@/features/gallery/result-card'
 import type { WorkspaceKind } from '@/features/status/workspace-header'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -16,6 +17,7 @@ type GalleryProps = {
   conversionModel?: ModelSpec
   onConversionModelChange?: (model: string) => void
   onConvertTo3d?: (sourceUrl: string) => void
+  onConvertManyTo3d?: (sourceUrls: string[]) => void
   isLoading: boolean
   isRefreshing: boolean
   onRefresh: () => void
@@ -41,6 +43,7 @@ export function Gallery({
   conversionModel,
   onConversionModelChange,
   onConvertTo3d,
+  onConvertManyTo3d,
   isLoading,
   isRefreshing,
   onRefresh,
@@ -48,10 +51,40 @@ export function Gallery({
   const newestFirst = items.toReversed()
   const pageCount = Math.max(1, Math.ceil(newestFirst.length / PAGE_SIZE))
   const [currentPage, setCurrentPage] = useState(1)
+  const [selectionMode, setSelectionMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set())
+  const [recentCount, setRecentCount] = useState('4')
   const isImage = workspace === 'image'
   const GalleryIcon = isImage ? ImageIcon : Box
   const activePage = Math.min(currentPage, pageCount)
   const visibleItems = newestFirst.slice((activePage - 1) * PAGE_SIZE, activePage * PAGE_SIZE)
+  const selectedItems = newestFirst.filter((item) => selectedIds.has(item.event_id))
+
+  const toggleSelection = (eventId: number, selected: boolean) => {
+    setSelectedIds((current) => {
+      const next = new Set(current)
+      if (selected) next.add(eventId)
+      else next.delete(eventId)
+      return next
+    })
+  }
+
+  const selectRecent = () => {
+    const count = Math.max(1, Math.min(newestFirst.length, Number.parseInt(recentCount, 10) || 1))
+    setRecentCount(String(count))
+    setSelectedIds(new Set(newestFirst.slice(0, count).map((item) => item.event_id)))
+    setSelectionMode(true)
+  }
+
+  const selectVisible = () => {
+    setSelectedIds((current) => new Set([...current, ...visibleItems.map((item) => item.event_id)]))
+    setSelectionMode(true)
+  }
+
+  const sendSelection = () => {
+    const urls = selectedItems.flatMap((item) => item.kind === 'image' ? [item.url] : [])
+    if (urls.length) onConvertManyTo3d?.(urls)
+  }
 
   return (
     <section className="min-w-0">
@@ -80,12 +113,51 @@ export function Gallery({
               </SelectContent>
             </Select>
           ) : null}
+          {isImage && onConvertManyTo3d ? (
+            <Button
+              type="button"
+              variant={selectionMode ? 'secondary' : 'outline'}
+              size="sm"
+              onClick={() => {
+                setSelectionMode((value) => !value)
+                if (selectionMode) setSelectedIds(new Set())
+              }}
+            >
+              <CheckSquare2 className="size-3.5" /> 批量转 3D
+            </Button>
+          ) : null}
           <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={isRefreshing}>
             <RefreshCw className={`size-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
             <span className="hidden sm:inline">刷新</span>
           </Button>
         </div>
       </div>
+
+      {isImage && selectionMode ? (
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-xl border border-primary/20 bg-primary/5 p-3">
+          <Badge variant="secondary" className="font-mono text-[10px]">已选 {selectedItems.length}</Badge>
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-muted-foreground">最近</span>
+            <Input
+              type="number"
+              min={1}
+              max={Math.max(1, newestFirst.length)}
+              value={recentCount}
+              onChange={(event) => setRecentCount(event.target.value)}
+              className="h-8 w-20"
+              aria-label="选择最近多少张图片"
+            />
+            <Button type="button" variant="outline" size="sm" onClick={selectRecent}>选择</Button>
+          </div>
+          <Button type="button" variant="outline" size="sm" onClick={selectVisible}>本页全选</Button>
+          <Button type="button" variant="ghost" size="sm" onClick={() => setSelectedIds(new Set())} disabled={!selectedItems.length}>
+            <X className="size-3.5" /> 清空
+          </Button>
+          <Button type="button" className="ml-auto" size="sm" onClick={sendSelection} disabled={!selectedItems.length}>
+            <Send className="size-3.5" /> 发送 {selectedItems.length || ''} 张到 {conversionModel?.label ?? '3D'}
+          </Button>
+        </div>
+      ) : null}
 
       {isLoading ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
@@ -100,6 +172,9 @@ export function Gallery({
               modelLabel={model?.label ?? item.model}
               onConvertTo3d={item.kind === 'image' ? onConvertTo3d : undefined}
               convertModelLabel={item.kind === 'image' ? conversionModel?.label : undefined}
+              selectable={item.kind === 'image' && selectionMode}
+              selected={selectedIds.has(item.event_id)}
+              onSelectedChange={(selected) => toggleSelection(item.event_id, selected)}
             />
           ))}
         </div>
