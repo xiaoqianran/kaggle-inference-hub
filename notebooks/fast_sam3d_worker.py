@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import io
+import json
 import multiprocessing as mp
 import os
 import signal
@@ -52,6 +53,12 @@ class RuntimeConfig:
     stage2_distillation: bool
     worker_count: int
     warmup_on_start: bool
+    sam2_enabled: bool
+    sam2_root: Path
+    sam2_checkpoint: Path
+    sam2_gpu: str
+    sam2_points_per_side: int
+    sam2_points_per_batch: int
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -85,6 +92,17 @@ class RuntimeConfig:
             stage2_distillation=_env_bool("FAST_SAM3D_STAGE2_DISTILLATION", True),
             worker_count=max(1, int(os.getenv("FAST_SAM3D_GPU_COUNT", "1"))),
             warmup_on_start=_env_bool("FAST_SAM3D_WARMUP_ON_START", False),
+            sam2_enabled=_env_bool("FAST_SAM3D_SAM2_ENABLED", True),
+            sam2_root=Path(os.getenv("FAST_SAM3D_SAM2_ROOT", "/kaggle/working/sam2")),
+            sam2_checkpoint=Path(
+                os.getenv(
+                    "FAST_SAM3D_SAM2_CHECKPOINT",
+                    "/kaggle/working/sam2/checkpoints/sam2.1_hiera_small.pt",
+                )
+            ),
+            sam2_gpu=os.getenv("FAST_SAM3D_SAM2_GPU", "auto").strip().lower(),
+            sam2_points_per_side=max(8, int(os.getenv("FAST_SAM3D_SAM2_POINTS_PER_SIDE", "20"))),
+            sam2_points_per_batch=max(8, int(os.getenv("FAST_SAM3D_SAM2_POINTS_PER_BATCH", "32"))),
         )
 
 
@@ -105,6 +123,7 @@ CHECKPOINT_DIR = CONFIG.checkpoint_dir
 TORCH_CACHE = CONFIG.torch_cache
 MAX_INPUT_SIDE = CONFIG.max_input_side
 MODEL = "fast-sam3d"
+MASK_MODEL = "fast-sam3d-mask"
 POLL_TIMEOUT = 35
 REQUEST_TIMEOUT = 180
 HEARTBEAT_SECONDS = 10
@@ -186,6 +205,11 @@ def validate_runtime() -> None:
         raise RuntimeError(f"Fast-SAM3D checkpoint config not found: {pipeline}")
     if not (NOTEBOOK_DIR / "inference.py").is_file():
         raise RuntimeError(f"Fast-SAM3D inference.py not found under {NOTEBOOK_DIR}")
+    if CONFIG.sam2_enabled:
+        if not CONFIG.sam2_root.is_dir():
+            raise RuntimeError(f"SAM2 root not found: {CONFIG.sam2_root}")
+        if not CONFIG.sam2_checkpoint.is_file():
+            raise RuntimeError(f"SAM2 checkpoint not found: {CONFIG.sam2_checkpoint}")
     TORCH_CACHE.mkdir(parents=True, exist_ok=True)
 
 
@@ -633,6 +657,175 @@ def build_inference(enable_acceleration: bool = True):
     return _install_low_vram_mode(inference)
 
 
+
+def choose_sam2_gpu() -> int:
+    requested = CONFIG.sam2_gpu
+    if requested != "auto":
+        index = int(requested)
+        if index < 0 or index >= torch.cuda.device_count():
+            raise RuntimeError(f"FAST_SAM3D_SAM2_GPU out of range: {index}")
+        return index
+    free_by_gpu: list[tuple[int, int]] = []
+    for index in range(torch.cuda.device_count()):
+        free, total = torch.cuda.mem_get_info(index)
+        free_by_gpu.append((int(free), index))
+        print(
+            f"[SAM2] GPU{index} free={free / 2**30:.2f}GiB total={total / 2**30:.2f}GiB",
+            flush=True,
+        )
+    return max(free_by_gpu)[1]
+
+
+def build_mask_generator():
+    if not CONFIG.sam2_enabled:
+        return None, None
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    from sam2.build_sam import build_sam2
+
+    gpu = choose_sam2_gpu()
+    device = f"cuda:{gpu}"
+    print(f"[SAM2] loading SAM2.1 Small on {device} ...", flush=True)
+    started = time.perf_counter()
+    model = build_sam2(
+        "configs/sam2.1/sam2.1_hiera_s.yaml",
+        str(CONFIG.sam2_checkpoint),
+        device=device,
+        apply_postprocessing=True,
+    )
+    generator = SAM2AutomaticMaskGenerator(
+        model,
+        points_per_side=CONFIG.sam2_points_per_side,
+        points_per_batch=CONFIG.sam2_points_per_batch,
+        pred_iou_thresh=0.72,
+        stability_score_thresh=0.88,
+        box_nms_thresh=0.7,
+        crop_n_layers=0,
+        min_mask_region_area=0,
+        output_mode="binary_mask",
+        multimask_output=True,
+    )
+    print(
+        f"[SAM2] READY on GPU{gpu} in {time.perf_counter() - started:.2f}s | "
+        f"points={CONFIG.sam2_points_per_side} batch={CONFIG.sam2_points_per_batch}",
+        flush=True,
+    )
+    return generator, gpu
+
+
+def rank_mask_candidates(annotations: list[dict[str, Any]], width: int, height: int, limit: int = 3):
+    image_area = max(1, width * height)
+    ranked: list[tuple[float, dict[str, Any], np.ndarray]] = []
+    for annotation in annotations:
+        mask = np.asarray(annotation.get("segmentation"), dtype=bool)
+        if mask.shape != (height, width) or not mask.any():
+            continue
+        area_ratio = float(mask.sum()) / image_area
+        if area_ratio < 0.015 or area_ratio > 0.94:
+            continue
+        ys, xs = np.nonzero(mask)
+        center_x = float(xs.mean()) / max(1, width - 1)
+        center_y = float(ys.mean()) / max(1, height - 1)
+        center_distance = ((center_x - 0.5) ** 2 + (center_y - 0.5) ** 2) ** 0.5 / 0.7072
+        center_score = max(0.0, 1.0 - center_distance)
+        area_score = max(0.0, 1.0 - abs(area_ratio - 0.32) / 0.62)
+        predicted_iou = float(annotation.get("predicted_iou", 0.0) or 0.0)
+        stability = float(annotation.get("stability_score", 0.0) or 0.0)
+        border_pixels = int(mask[0, :].sum() + mask[-1, :].sum() + mask[:, 0].sum() + mask[:, -1].sum())
+        border_ratio = border_pixels / max(1, 2 * (width + height))
+        border_penalty = min(0.25, border_ratio * 1.5)
+        score = 0.42 * predicted_iou + 0.30 * stability + 0.18 * center_score + 0.10 * area_score - border_penalty
+        ranked.append((score, annotation, mask))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    selected: list[tuple[float, dict[str, Any], np.ndarray]] = []
+    for candidate in ranked:
+        mask = candidate[2]
+        duplicate = False
+        for existing in selected:
+            other = existing[2]
+            intersection = np.logical_and(mask, other).sum()
+            union = np.logical_or(mask, other).sum()
+            if union and intersection / union >= 0.88:
+                duplicate = True
+                break
+        if not duplicate:
+            selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def encode_mask_png(mask: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    Image.fromarray(mask.astype(np.uint8) * 255, mode="L").save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def run_mask_task(
+    generator: Any,
+    sam_gpu: int,
+    session: requests.Session,
+    worker_id: str,
+    task: dict[str, Any],
+) -> None:
+    task_id = int(task["id"])
+    started = time.perf_counter()
+    response = session.get(api_url(task["input_url"]), timeout=60)
+    checked_response(response, "GET mask source image")
+    image = Image.open(io.BytesIO(response.content)).convert("RGB")
+    image_array = np.asarray(image, dtype=np.uint8)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+        annotations = generator.generate(image_array)
+    selected = rank_mask_candidates(
+        annotations,
+        image.width,
+        image.height,
+        limit=int(task.get("max_candidates", 3)),
+    )
+    if not selected:
+        raise RuntimeError("SAM2 did not produce a usable foreground mask")
+
+    files: dict[str, tuple[str, bytes, str]] = {}
+    metadata: list[dict[str, Any]] = []
+    for index, (score, annotation, mask) in enumerate(selected):
+        png = encode_mask_png(mask)
+        files[f"mask{index}"] = (
+            f"mask-{task_id}-{index}.png.bin",
+            encrypt_blob(png),
+            "application/octet-stream",
+        )
+        metadata.append(
+            {
+                "score": round(float(score), 6),
+                "area_ratio": round(float(mask.mean()), 6),
+                "bbox": [round(float(value), 2) for value in annotation.get("bbox", [])],
+                "predicted_iou": round(float(annotation.get("predicted_iou", 0.0) or 0.0), 6),
+                "stability_score": round(float(annotation.get("stability_score", 0.0) or 0.0), 6),
+            }
+        )
+    elapsed = time.perf_counter() - started
+    upload = session.post(
+        api_url("/upload/masks"),
+        data={
+            "id": str(task_id),
+            "gpu": str(sam_gpu),
+            "seconds": f"{elapsed:.3f}",
+            "worker_id": worker_id,
+            "metadata": json.dumps(metadata),
+        },
+        files=files,
+        timeout=REQUEST_TIMEOUT,
+    )
+    checked_response(upload, "POST /upload/masks")
+    print(
+        f"[SAM2 GPU{sam_gpu}] ✓ mask #{task_id} candidates={len(selected)} total={elapsed:.2f}s",
+        flush=True,
+    )
+    del annotations, selected, image_array, image
+    gc.collect()
+
+
+
 def prepare_inputs(image_raw: bytes, mask_raw: bytes, directory: Path):
     from fft.fft2d import calculate_hfer_robust
 
@@ -774,6 +967,98 @@ def warmup_inference(inference: Any) -> None:
     print(f"[warmup] ready in {time.perf_counter() - started:.2f}s", flush=True)
 
 
+def claim_task(
+    session: requests.Session,
+    model: str,
+    worker_id: str,
+    hub_instance_id: str,
+    wait_seconds: float,
+) -> dict[str, Any] | None:
+    response = session.post(
+        api_url("/task/claim"),
+        json={"model": model, "worker_id": worker_id, "wait_seconds": wait_seconds},
+        timeout=max(10, int(wait_seconds) + 10),
+    )
+    response_instance = response.headers.get("X-Hub-Instance", "")
+    if response_instance and response_instance != hub_instance_id:
+        raise RuntimeError(
+            f"Hub instance changed: expected={hub_instance_id[:12]} got={response_instance[:12]}"
+        )
+    if response.status_code == 204:
+        return None
+    checked_response(response, f"POST /task/claim ({model})")
+    return response.json()
+
+
+def run_fast_sam3d_task(
+    inference: Any,
+    session: requests.Session,
+    worker_id: str,
+    gpu: int,
+    task: dict[str, Any],
+) -> None:
+    task_id = int(task["id"])
+    seed = int(task.get("seed", 42))
+    print(
+        f"[GPU{gpu}] ↓ #{task_id} {task.get('source_label', 'input')} seed={seed}",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    image_response = session.get(api_url(task["input_url"]), timeout=60)
+    checked_response(image_response, "GET Fast-SAM3D input")
+    mask_response = session.get(api_url(task["mask_url"]), timeout=60)
+    checked_response(mask_response, "GET Fast-SAM3D mask")
+    t_download = time.perf_counter()
+
+    with tempfile.TemporaryDirectory(prefix=f"fastsam3d-{task_id}-") as temp_dir:
+        temp = Path(temp_dir)
+        image, mask, hfer = prepare_inputs(
+            image_response.content, mask_response.content, temp
+        )
+        t_pre = time.perf_counter()
+        if hasattr(inference, "get_hfer"):
+            inference.get_hfer(hfer)
+        with torch.inference_mode():
+            output = run_model(inference, image, mask, seed)
+        t_model = time.perf_counter()
+        artifact = export_glb(output["glb"], temp / "result.glb")
+        encrypted = encrypt_blob(artifact)
+        t_export = time.perf_counter()
+
+    elapsed = t_export - t0
+    upload = session.post(
+        api_url("/upload/artifact"),
+        data={
+            "id": str(task_id),
+            "model": MODEL,
+            "worker_id": worker_id,
+            "gpu": str(gpu),
+            "seconds": f"{elapsed:.3f}",
+            "output_format": "glb",
+        },
+        files={
+            "file": (
+                f"{task_id}.glb.bin",
+                encrypted,
+                "application/octet-stream",
+            )
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    checked_response(upload, "POST /upload/artifact")
+    t_upload = time.perf_counter()
+    print(
+        f"[GPU{gpu}] ✓ #{task_id} total={elapsed:.2f}s "
+        f"download={t_download - t0:.2f}s preprocess={t_pre - t_download:.2f}s "
+        f"model={t_model - t_pre:.2f}s export={t_export - t_model:.2f}s "
+        f"upload={t_upload - t_export:.2f}s",
+        flush=True,
+    )
+    del image, mask, hfer, output, artifact, encrypted
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
     torch.cuda.set_device(gpu)
     gpu_name = torch.cuda.get_device_name(gpu)
@@ -784,6 +1069,7 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
     inference = build_inference(enable_acceleration=True)
     if CONFIG.warmup_on_start:
         warmup_inference(inference)
+    mask_generator, sam_gpu = build_mask_generator()
     print(f"[GPU{gpu}] READY in {time.perf_counter() - started:.2f}s", flush=True)
 
     session = requests.Session()
@@ -794,7 +1080,7 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
             "worker_id": worker_id,
             "model": MODEL,
             "gpus": [gpu_name],
-            "runtime": "fast-sam3d-persistent-py311",
+            "runtime": "fast-sam3d+sam2.1-persistent-py311",
             "concurrency": 1,
             "meta": {
                 "gpu_index": gpu,
@@ -802,6 +1088,9 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
                 "torch_cuda": torch.version.cuda,
                 "persistent": True,
                 "checkpoint_dir": str(CHECKPOINT_DIR),
+                "sam2_enabled": mask_generator is not None,
+                "sam2_gpu": sam_gpu,
+                "sam2_model": "sam2.1_hiera_small" if mask_generator is not None else None,
             },
         },
         timeout=30,
@@ -829,104 +1118,39 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
         while True:
             task: dict[str, Any] | None = None
             try:
-                response = session.post(
-                    api_url("/task/claim"),
-                    json={"model": MODEL, "worker_id": worker_id, "wait_seconds": 25},
-                    timeout=POLL_TIMEOUT,
-                )
-                response_instance = response.headers.get("X-Hub-Instance", "")
-                if response_instance and response_instance != hub_instance_id:
-                    raise RuntimeError(
-                        f"Hub instance changed: expected={hub_instance_id[:12]} got={response_instance[:12]}"
-                    )
-                if response.status_code == 204:
+                # Mask generation is interactive, so check it before the longer 3D queue poll.
+                if mask_generator is not None:
+                    task = claim_task(session, MASK_MODEL, worker_id, hub_instance_id, 0)
+                if task is None:
+                    task = claim_task(session, MODEL, worker_id, hub_instance_id, 5)
+                if task is None:
                     now = time.monotonic()
                     if now - last_idle_diagnostic >= IDLE_DIAGNOSTIC_SECONDS:
                         last_idle_diagnostic = now
                         snapshot = server_snapshot(session)
-                        queued = int(
-                            snapshot.get("queued_by_model", {}).get(MODEL, 0) or 0
-                        )
-                        inflight = int(
-                            snapshot.get("inflight_by_model", {}).get(MODEL, 0) or 0
-                        )
+                        queued_3d = int(snapshot.get("queued_by_model", {}).get(MODEL, 0) or 0)
+                        queued_mask = int(snapshot.get("queued_by_model", {}).get(MASK_MODEL, 0) or 0)
+                        inflight_3d = int(snapshot.get("inflight_by_model", {}).get(MODEL, 0) or 0)
                         print(
-                            f"[GPU{gpu}] idle | Hub {MODEL} queued={queued} inflight={inflight} "
+                            f"[GPU{gpu}] idle | 3d={queued_3d}/{inflight_3d} mask={queued_mask} "
                             f"instance={str(snapshot.get('hub_instance_id', ''))[:12]}",
                             flush=True,
                         )
                     continue
-                checked_response(response, "POST /task/claim")
-                task = response.json()
+
                 task_id = int(task["id"])
                 active_task["id"] = task_id
-                seed = int(task.get("seed", 42))
-                print(
-                    f"[GPU{gpu}] ↓ #{task_id} {task.get('source_label', 'input')} seed={seed}",
-                    flush=True,
-                )
-
-                t0 = time.perf_counter()
-                image_response = session.get(api_url(task["input_url"]), timeout=60)
-                image_response.raise_for_status()
-                mask_response = session.get(api_url(task["mask_url"]), timeout=60)
-                mask_response.raise_for_status()
-                t_download = time.perf_counter()
-
-                with tempfile.TemporaryDirectory(
-                    prefix=f"fastsam3d-{task_id}-"
-                ) as temp_dir:
-                    temp = Path(temp_dir)
-                    image, mask, hfer = prepare_inputs(
-                        image_response.content, mask_response.content, temp
+                if task.get("model") == MASK_MODEL:
+                    if mask_generator is None or sam_gpu is None:
+                        raise RuntimeError("SAM2 mask service is disabled")
+                    print(
+                        f"[SAM2 GPU{sam_gpu}] ↓ mask #{task_id} {task.get('source_label', 'input')}",
+                        flush=True,
                     )
-                    t_pre = time.perf_counter()
-
-                    if hasattr(inference, "get_hfer"):
-                        inference.get_hfer(hfer)
-                    with torch.inference_mode():
-                        output = run_model(inference, image, mask, seed)
-                    t_model = time.perf_counter()
-
-                    artifact = export_glb(output["glb"], temp / "result.glb")
-                    encrypted = encrypt_blob(artifact)
-                    t_export = time.perf_counter()
-
-                elapsed = t_export - t0
-                upload = session.post(
-                    api_url("/upload/artifact"),
-                    data={
-                        "id": str(task_id),
-                        "model": MODEL,
-                        "worker_id": worker_id,
-                        "gpu": str(gpu),
-                        "seconds": f"{elapsed:.3f}",
-                        "output_format": "glb",
-                    },
-                    files={
-                        "file": (
-                            f"{task_id}.glb.bin",
-                            encrypted,
-                            "application/octet-stream",
-                        )
-                    },
-                    timeout=REQUEST_TIMEOUT,
-                )
-                checked_response(upload, "POST /upload/artifact")
-                t_upload = time.perf_counter()
+                    run_mask_task(mask_generator, sam_gpu, session, worker_id, task)
+                else:
+                    run_fast_sam3d_task(inference, session, worker_id, gpu, task)
                 active_task["id"] = None
-
-                print(
-                    f"[GPU{gpu}] ✓ #{task_id} total={elapsed:.2f}s "
-                    f"download={t_download - t0:.2f}s preprocess={t_pre - t_download:.2f}s "
-                    f"model={t_model - t_pre:.2f}s export={t_export - t_model:.2f}s "
-                    f"upload={t_upload - t_export:.2f}s",
-                    flush=True,
-                )
-
-                del image, mask, hfer, output, artifact, encrypted
-                gc.collect()
-                torch.cuda.empty_cache()
 
             except KeyboardInterrupt:
                 raise

@@ -9,6 +9,7 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { useSubmitArtifact } from '@/features/artifacts/use-submit-artifact'
+import { FastSam3DMaskEditor } from '@/features/fast-sam3d/fast-sam3d-mask-editor'
 import type { ArtifactOptionSpec, ArtifactOptionValue, HubStatus, ModelSpec } from '@/shared/api/types'
 
 type ImageToArtifactPanelProps = {
@@ -119,28 +120,46 @@ export function ImageToArtifactPanel({ model, token, status, sourceUrl, onSource
           </div>
         )}
 
-        {artifact.auxiliary_inputs.map((input) => (
-          <div key={input.id} className="space-y-2">
-            <Label htmlFor={`${model.id}-${input.id}`}>{input.label}{input.required ? ' · 必需' : ''}</Label>
-            <Input
-              key={`${model.id}-${input.id}-${resetKey}`}
-              id={`${model.id}-${input.id}`}
-              type="file"
-              accept="image/png,image/jpeg,image/webp"
-              onChange={(event) => {
-                const selected = event.target.files?.[0]
+        {artifact.auxiliary_inputs.map((input) =>
+          model.id === 'fast-sam3d' && input.id === 'mask' ? (
+            <FastSam3DMaskEditor
+              key={`fast-sam3d-mask-${resetKey}`}
+              token={token}
+              sourceUrl={sourceUrl}
+              file={file}
+              resetKey={resetKey}
+              onMaskChange={(mask) => {
                 setAuxiliaryFiles((current) => {
                   const next = { ...current }
-                  if (selected) next[input.id] = selected
-                  else delete next[input.id]
+                  if (mask) next.mask = mask
+                  else delete next.mask
                   return next
                 })
               }}
-              className="cursor-pointer file:mr-3 file:text-foreground"
             />
-            {input.help ? <p className="text-[11px] text-muted-foreground">{input.help}</p> : null}
-          </div>
-        ))}
+          ) : (
+            <div key={input.id} className="space-y-2">
+              <Label htmlFor={`${model.id}-${input.id}`}>{input.label}{input.required ? ' · 必需' : ''}</Label>
+              <Input
+                key={`${model.id}-${input.id}-${resetKey}`}
+                id={`${model.id}-${input.id}`}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                onChange={(event) => {
+                  const selected = event.target.files?.[0]
+                  setAuxiliaryFiles((current) => {
+                    const next = { ...current }
+                    if (selected) next[input.id] = selected
+                    else delete next[input.id]
+                    return next
+                  })
+                }}
+                className="cursor-pointer file:mr-3 file:text-foreground"
+              />
+              {input.help ? <p className="text-[11px] text-muted-foreground">{input.help}</p> : null}
+            </div>
+          ),
+        )}
 
         {scalarOptions.length ? (
           <div className="grid grid-cols-2 gap-3">

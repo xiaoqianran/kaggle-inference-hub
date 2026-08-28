@@ -92,6 +92,13 @@ class HubState:
                 );
                 CREATE INDEX IF NOT EXISTS history_model_event
                     ON history(model, event_id);
+                CREATE TABLE IF NOT EXISTS mask_results (
+                    task_id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS mask_results_created
+                    ON mask_results(created_at);
                 CREATE TABLE IF NOT EXISTS workers (
                     worker_id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
@@ -305,6 +312,60 @@ class HubState:
     def complete(self, task_id: int) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+
+    def task_status(self, task_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT model, status, worker_id, created_at FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mask_result(self, task_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM mask_results WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return self._load(row["payload"]) if row else None
+
+    def failed_task(self, task_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM failed WHERE task_id = ? ORDER BY event_id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return self._load(row["payload"]) if row else None
+
+    def finish_mask(self, task_id: int, item: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                exists = connection.execute(
+                    "SELECT 1 FROM tasks WHERE id = ? AND status = 'inflight'", (task_id,)
+                ).fetchone()
+                if exists is None:
+                    raise KeyError(task_id)
+                now = float(item.get("time", time.time()))
+                connection.execute(
+                    """
+                    INSERT INTO mask_results(task_id, payload, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        payload = excluded.payload, created_at = excluded.created_at
+                    """,
+                    (task_id, self._dump(item), now),
+                )
+                connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+                connection.execute(
+                    "DELETE FROM mask_results WHERE task_id NOT IN "
+                    "(SELECT task_id FROM mask_results ORDER BY created_at DESC LIMIT ?)",
+                    (HISTORY_LIMIT,),
+                )
+                connection.commit()
+                return item
+            except Exception:
+                connection.rollback()
+                raise
 
     def renew_lease(self, task_id: int, worker_id: str) -> bool:
         with self._connect() as connection:

@@ -1,8 +1,10 @@
 import type {
+  ArtifactSource,
   ArtifactSubmission,
   BatchTaskRequest,
   HistoryItem,
   HubStatus,
+  MaskTaskStatus,
   ModelSpec,
   PromptBatchResult,
   PromptPipelineConfig,
@@ -118,4 +120,36 @@ export function queueArtifactTask(token: string, submission: ArtifactSubmission)
     headers: { Authorization: `Bearer ${token}` },
     body: form,
   })
+}
+
+export function queueAutoMask(token: string, source: ArtifactSource): Promise<QueueResponse> {
+  const form = new FormData()
+  if (source.kind === 'file') {
+    form.append('file', source.file, source.file.name)
+  } else {
+    form.append('source_url', source.sourceUrl)
+  }
+  return requestJson('/mask/auto', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  })
+}
+
+export function getMaskStatus(token: string, taskId: number): Promise<MaskTaskStatus> {
+  return requestJson(`/mask/${taskId}?_ts=${Date.now()}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+export async function getMaskCandidate(token: string, path: string): Promise<Blob> {
+  const response = await fetch(path, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: 'no-store',
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    throw new ApiError(text || `HTTP ${response.status}`, response.status)
+  }
+  return response.blob()
 }

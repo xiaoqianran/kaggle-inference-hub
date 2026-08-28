@@ -173,6 +173,74 @@ def test_http_protocol(directory: Path) -> None:
         status = client.get("/api/status").json()
         assert status["storage"] == "sqlite" and status["inflight"] == 0
 
+        public_models = client.get("/api/models").json()
+        assert "fast-sam3d-mask" not in {item["id"] for item in public_models}
+
+        mask_queued = client.post(
+            "/mask/auto",
+            headers=headers,
+            files={"file": ("mask-source.png", png, "image/png")},
+        )
+        assert mask_queued.status_code == 202, mask_queued.text
+        mask_task_id = mask_queued.json()["task"]["id"]
+        mask_pending = client.get(f"/mask/{mask_task_id}", headers=headers)
+        assert mask_pending.status_code == 200
+        assert mask_pending.json()["status"] == "queued"
+
+        mask_claimed = client.post(
+            "/task/claim",
+            headers=headers,
+            json={"model": "fast-sam3d-mask", "worker_id": "mask-http-gpu-0", "wait_seconds": 0},
+        )
+        assert mask_claimed.status_code == 200, mask_claimed.text
+        mask_task = mask_claimed.json()
+        assert mask_task["id"] == mask_task_id
+        assert mask_task["model"] == "fast-sam3d-mask"
+        assert client.get(mask_task["input_url"], headers=headers).content == png
+        mask_inflight = client.get(f"/mask/{mask_task_id}", headers=headers).json()
+        assert mask_inflight["status"] == "inflight"
+
+        mask_pngs = [
+            b"\x89PNG\r\n\x1a\n" + f"candidate-{index}".encode()
+            for index in range(3)
+        ]
+        encrypted_masks = []
+        for mask_png in mask_pngs:
+            mask_nonce = os.urandom(12)
+            encrypted_masks.append(mask_nonce + AESGCM(key).encrypt(mask_nonce, mask_png, None))
+        mask_uploaded = client.post(
+            "/upload/masks",
+            headers=headers,
+            data={
+                "id": str(mask_task_id),
+                "gpu": "1",
+                "seconds": "0.125",
+                "worker_id": "mask-http-gpu-0",
+                "metadata": json.dumps([
+                    {"score": 0.97, "area_ratio": 0.31, "bbox": [1, 2, 3, 4]},
+                    {"score": 0.91, "area_ratio": 0.22, "bbox": [2, 3, 4, 5]},
+                    {"score": 0.87, "area_ratio": 0.18, "bbox": [3, 4, 5, 6]},
+                ]),
+            },
+            files={
+                "mask0": ("mask0.png.bin", encrypted_masks[0], "application/octet-stream"),
+                "mask1": ("mask1.png.bin", encrypted_masks[1], "application/octet-stream"),
+                "mask2": ("mask2.png.bin", encrypted_masks[2], "application/octet-stream"),
+            },
+        )
+        assert mask_uploaded.status_code == 200, mask_uploaded.text
+        mask_ready = client.get(f"/mask/{mask_task_id}", headers=headers)
+        assert mask_ready.status_code == 200, mask_ready.text
+        mask_ready_payload = mask_ready.json()
+        assert mask_ready_payload["status"] == "ready"
+        assert len(mask_ready_payload["candidates"]) == 3
+        assert "_path" not in mask_ready_payload["candidates"][0]
+        for index, expected in enumerate(mask_pngs):
+            fetched_mask = client.get(
+                f"/mask/{mask_task_id}/candidate/{index}", headers=headers
+            )
+            assert fetched_mask.status_code == 200
+            assert fetched_mask.content == expected
 
         fast_queued = client.post(
             "/task/fast-sam3d",
@@ -271,6 +339,8 @@ def main():
     assert MODEL_SPECS["triposr"].input_kind == "image"
     assert MODEL_SPECS["fast-sam3d"].input_kind == "image"
     assert MODEL_SPECS["fast-sam3d"].output_kind == "artifact"
+    assert MODEL_SPECS["fast-sam3d-mask"].visible is False
+    assert MODEL_SPECS["fast-sam3d-mask"].output_kind == "mask"
     assert MODEL_SPECS["hunyuan3d-2.1"].input_kind == "image"
     assert MODEL_SPECS["hunyuan3d-2.1"].output_kind == "artifact"
 
@@ -326,6 +396,12 @@ def main():
     assert 'Fast-SAM3D · Kaggle 双 T4 常驻 Worker' in fast_notebook_text
     assert 'update-alternatives' not in fast_notebook_text
     assert 'KAGGLE_HUB_TOKEN' in fast_notebook_text
+    assert 'MASK_MODEL = "fast-sam3d-mask"' in fast_worker_text
+    assert 'build_mask_generator()' in fast_worker_text
+    assert 'SAM2AutomaticMaskGenerator' in fast_worker_text
+    assert '/upload/masks' in fast_worker_text
+    assert 'FAST_SAM3D_SAM2_ENABLED' in fast_notebook_text
+    assert 'sam2.1_hiera_small.pt' in fast_notebook_text
 
     hunyuan_nb = root / "notebooks" / "008-hunyuan3d-2.1.ipynb"
     hunyuan_worker = root / "notebooks" / "hunyuan3d21_worker.py"
@@ -344,7 +420,7 @@ def main():
 
     print(
         "OK: SQLite cross-process queue + atomic claims + durable leases/history + "
-        "AES-GCM + synchronized persistent TripoSR/Fast-SAM3D/Hunyuan3D workers"
+        "AES-GCM + persistent SAM2 mask service + synchronized TripoSR/Fast-SAM3D/Hunyuan3D workers"
     )
 
 

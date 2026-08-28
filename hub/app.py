@@ -36,7 +36,8 @@ from .crypto import decrypt_blob
 from .prompt_pipeline import PromptPipeline, PromptPipelineError, PromptPipelineSettings
 from .state import state
 
-app = FastAPI(title="Kaggle Inference Hub", version="0.6.0")
+app = FastAPI(title="Kaggle Inference Hub", version="0.7.0")
+MASK_MODEL = "fast-sam3d-mask"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 WEB_DIR = Path(__file__).with_name("web")
 
@@ -256,6 +257,41 @@ async def store_image_upload(upload: UploadFile, *, prefix: str, task_id: int, l
     return path, suffix
 
 
+async def resolve_task_source(
+    file: UploadFile | None,
+    source_url: str,
+    *,
+    prefix: str,
+    task_id: int,
+) -> tuple[Path, str, str, bool]:
+    source_url = source_url.strip()
+    if (file is None) == (not source_url):
+        raise HTTPException(status_code=400, detail="Provide exactly one of file or source_url")
+    if file is not None:
+        path, suffix = await store_image_upload(file, prefix=prefix, task_id=task_id, label="Input image")
+        return path, Path(file.filename or f"upload{suffix}").name, f"/outputs/_inputs/{path.name}", True
+    path = local_output_path(source_url)
+    return path, path.name, urlsplit(source_url).path, False
+
+
+def cleanup_owned_task_files(task: dict[str, Any]) -> None:
+    root = OUTPUT_DIR.resolve()
+    for key, owned in task.items():
+        if not key.startswith("_owned_") or not owned:
+            continue
+        name = key[len("_owned_"):]
+        path_key = "_input_path" if name == "input" else f"_{name}_path"
+        raw_path = task.get(path_key)
+        if not raw_path:
+            continue
+        try:
+            path = Path(str(raw_path)).resolve()
+            if path.is_relative_to(root):
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 async def enqueue_artifact_task(
     model: str,
     *,
@@ -267,10 +303,6 @@ async def enqueue_artifact_task(
     model = artifact_model_or_400(model)
     spec = MODEL_SPECS[model].artifact
     assert spec is not None
-    source_url = source_url.strip()
-    if (file is None) == (not source_url):
-        raise HTTPException(status_code=400, detail="Provide exactly one of file or source_url")
-
     auxiliary_uploads = auxiliary_uploads or {}
     expected_aux = {item.id: item for item in spec.auxiliary_inputs}
     unknown_aux = sorted(set(auxiliary_uploads) - set(expected_aux))
@@ -285,15 +317,14 @@ async def enqueue_artifact_task(
     owned_paths: list[Path] = []
     prefix = safe_model_prefix(model)
     try:
-        if file is not None:
-            input_path, suffix = await store_image_upload(file, prefix=prefix, task_id=task_id, label="Input image")
+        input_path, source_label, public_source_url, owned_input = await resolve_task_source(
+            file,
+            source_url,
+            prefix=prefix,
+            task_id=task_id,
+        )
+        if owned_input:
             owned_paths.append(input_path)
-            source_label = Path(file.filename or f"upload{suffix}").name
-            public_source_url = f"/outputs/_inputs/{input_path.name}"
-        else:
-            input_path = local_output_path(source_url)
-            source_label = input_path.name
-            public_source_url = urlsplit(source_url).path
 
         task: dict[str, Any] = {
             "id": task_id,
@@ -305,7 +336,7 @@ async def enqueue_artifact_task(
             "created_at": time.time(),
             "attempt": 0,
             "_input_path": str(input_path.resolve()),
-            "_owned_input": file is not None,
+            "_owned_input": owned_input,
         }
 
         for item in spec.auxiliary_inputs:
@@ -402,7 +433,7 @@ async def broadcast(item: dict) -> None:
 
 @app.get("/api/models")
 def models():
-    return [asdict(spec) for spec in MODEL_SPECS.values()]
+    return [asdict(spec) for spec in MODEL_SPECS.values() if spec.visible]
 
 
 @app.get("/api/prompt/pipeline")
@@ -571,6 +602,171 @@ async def add_artifact_task(
         options=options,
         auxiliary_uploads=auxiliary_uploads,  # type: ignore[arg-type]
     )
+
+
+async def enqueue_mask_task(file: UploadFile | None, source_url: str) -> dict[str, Any]:
+    task_id = state.next_id()
+    input_path, source_label, public_source_url, owned_input = await resolve_task_source(
+        file,
+        source_url,
+        prefix="fast_sam3d_mask",
+        task_id=task_id,
+    )
+    task = {
+        "id": task_id,
+        "model": MASK_MODEL,
+        "input_url": f"/task/input/{task_id}",
+        "source_url": public_source_url,
+        "source_label": source_label,
+        "max_candidates": 3,
+        "created_at": time.time(),
+        "attempt": 0,
+        "_input_path": str(input_path.resolve()),
+        "_owned_input": owned_input,
+    }
+    try:
+        state.enqueue(task)
+    except queue.Full:
+        if owned_input:
+            input_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail="Mask queue is full")
+    return {
+        "queued": 1,
+        "queue_size": state.queue_size(MASK_MODEL),
+        "task": {key: value for key, value in task.items() if not key.startswith("_")},
+    }
+
+
+@app.post("/mask/auto", status_code=202)
+async def create_auto_mask(
+    file: UploadFile | None = File(None),
+    source_url: str = Form(""),
+    authorization: str | None = Header(None),
+):
+    auth(authorization)
+    return await enqueue_mask_task(file, source_url)
+
+
+@app.get("/mask/{task_id}")
+def get_mask_status(task_id: int, authorization: str | None = Header(None)):
+    auth(authorization)
+    result = state.mask_result(task_id)
+    if result is not None:
+        public_candidates = [
+            {key: value for key, value in item.items() if key != "_path"}
+            for item in result.get("candidates", [])
+        ]
+        return {"status": "ready", **{key: value for key, value in result.items() if key != "candidates"}, "candidates": public_candidates}
+    task = state.task_status(task_id)
+    if task is not None and task.get("model") == MASK_MODEL:
+        return {"status": task.get("status", "queued"), "id": task_id}
+    failed = state.failed_task(task_id)
+    if failed is not None and failed.get("model") == MASK_MODEL:
+        return {"status": "failed", "id": task_id, "error": failed.get("error", "Mask generation failed")}
+    raise HTTPException(status_code=404, detail="Mask task does not exist")
+
+
+@app.get("/mask/{task_id}/candidate/{index}")
+def get_mask_candidate(task_id: int, index: int, authorization: str | None = Header(None)):
+    auth(authorization)
+    result = state.mask_result(task_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Mask result is not ready")
+    candidates = result.get("candidates", [])
+    if index < 0 or index >= len(candidates):
+        raise HTTPException(status_code=404, detail="Mask candidate does not exist")
+    raw_path = candidates[index].get("_path", "")
+    try:
+        path = Path(str(raw_path)).resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise HTTPException(status_code=404, detail="Mask file does not exist")
+    root = OUTPUT_DIR.resolve()
+    if not path.is_relative_to(root) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Mask file does not exist")
+    return FileResponse(path, filename=f"mask-{task_id}-{index}.png", media_type="image/png")
+
+
+@app.post("/upload/masks")
+async def upload_masks(
+    mask0: UploadFile = File(...),
+    mask1: UploadFile | None = File(None),
+    mask2: UploadFile | None = File(None),
+    id: int = Form(...),
+    gpu: int = Form(...),
+    seconds: float = Form(0),
+    worker_id: str = Form(...),
+    metadata: str = Form("[]"),
+    authorization: str | None = Header(None),
+):
+    auth(authorization)
+    owner = state.lease_owner(id)
+    leased_task = state.lease_task(id)
+    if leased_task is None or leased_task.get("model") != MASK_MODEL:
+        raise HTTPException(status_code=409, detail="Mask task is no longer inflight")
+    if owner != worker_id:
+        raise HTTPException(status_code=409, detail=f"Task lease belongs to {owner}, not {worker_id}")
+    try:
+        meta = json.loads(metadata)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid mask metadata JSON: {exc.msg}")
+    if not isinstance(meta, list):
+        raise HTTPException(status_code=400, detail="Mask metadata must be a list")
+
+    uploads = [item for item in (mask0, mask1, mask2) if item is not None]
+    if not 1 <= len(uploads) <= 3:
+        raise HTTPException(status_code=400, detail="Upload between 1 and 3 mask candidates")
+    mask_dir = OUTPUT_DIR / "_masks"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    candidates: list[dict[str, Any]] = []
+    try:
+        for index, upload in enumerate(uploads):
+            encrypted = await upload.read(INPUT_MAX_BYTES + 29)
+            if len(encrypted) > INPUT_MAX_BYTES + 28:
+                raise HTTPException(status_code=413, detail="Encrypted mask is too large")
+            try:
+                data = await asyncio.to_thread(decrypt_blob, encrypted, TOKEN)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Mask decrypt failed: {type(exc).__name__}")
+            if len(data) > INPUT_MAX_BYTES or image_suffix(data) != ".png":
+                raise HTTPException(status_code=400, detail="Mask candidate must be a PNG")
+            path = mask_dir / f"{id:06d}_{index}.png"
+            await asyncio.to_thread(path.write_bytes, data)
+            paths.append(path)
+            item = meta[index] if index < len(meta) and isinstance(meta[index], dict) else {}
+            candidates.append({
+                "index": index,
+                "score": float(item.get("score", 0.0) or 0.0),
+                "area_ratio": float(item.get("area_ratio", 0.0) or 0.0),
+                "bbox": item.get("bbox", []),
+                "url": f"/mask/{id}/candidate/{index}",
+                "_path": str(path.resolve()),
+            })
+        result = {
+            "id": id,
+            "model": MASK_MODEL,
+            "worker_id": worker_id,
+            "gpu": gpu,
+            "seconds": seconds,
+            "source_url": leased_task.get("source_url", ""),
+            "source_label": leased_task.get("source_label", "input image"),
+            "candidates": candidates,
+            "time": time.time(),
+        }
+        state.finish_mask(id, result)
+    except KeyError:
+        for path in paths:
+            path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail="Mask task is no longer inflight")
+    except Exception:
+        for path in paths:
+            path.unlink(missing_ok=True)
+        raise
+    cleanup_owned_task_files(leased_task)
+    state.heartbeat(worker_id, {"last_mask_task": id})
+    return {key: value for key, value in result.items() if key != "candidates"} | {
+        "candidates": [{key: value for key, value in item.items() if key != "_path"} for item in candidates]
+    }
 
 
 # Legacy model-specific endpoints remain as compatibility aliases. The current
@@ -853,6 +1049,7 @@ async def upload_artifact(
     except KeyError:
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=409, detail="Task is no longer inflight")
+    cleanup_owned_task_files(leased_task)
     state.heartbeat(worker_id, {"last_completed_task": id})
     await broadcast(item)
     return item

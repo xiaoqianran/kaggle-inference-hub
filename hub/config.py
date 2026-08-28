@@ -45,6 +45,7 @@ class ModelSpec:
     input_kind: str = "prompt"
     output_kind: str = "image"
     artifact: ArtifactSpec | None = None
+    visible: bool = True
 
 
 MODEL_SPECS = {
@@ -107,6 +108,15 @@ MODEL_SPECS = {
                 ArtifactInputSpec("mask", "Mask", "与 RGB 同尺寸的非空 mask；建议 PNG 黑白图"),
             ),
         ),
+    ),
+    "fast-sam3d-mask": ModelSpec(
+        id="fast-sam3d-mask",
+        label="Fast-SAM3D Mask Service",
+        default_steps=0,
+        description="internal SAM2.1 mask generation queue",
+        input_kind="image",
+        output_kind="mask",
+        visible=False,
     ),
     "hunyuan3d-2.1": ModelSpec(
         id="hunyuan3d-2.1",

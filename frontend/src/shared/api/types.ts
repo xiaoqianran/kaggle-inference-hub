@@ -129,6 +129,23 @@ export type ArtifactSubmission = {
   auxiliaryFiles?: Record<string, File>
 }
 
+export type MaskCandidate = {
+  index: number
+  score: number
+  area_ratio: number
+  bbox: number[]
+  url: string
+}
+
+export type MaskTaskStatus = {
+  id: number
+  status: 'queued' | 'inflight' | 'ready' | 'failed'
+  error?: string
+  gpu?: number
+  seconds?: number
+  candidates?: MaskCandidate[]
+}
+
 export type Worker = {
   worker_id: string
   model: string
