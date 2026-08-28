@@ -210,6 +210,23 @@ def preflight_hub() -> str:
     return instance_id
 
 
+def wait_for_hub() -> str:
+    attempt = 0
+    while True:
+        try:
+            return preflight_hub()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - Kaggle worker must survive Hub restarts/outages
+            attempt += 1
+            delay = min(30, 3 + attempt)
+            print(
+                f"[preflight] Hub unavailable: {type(exc).__name__}: {exc} | retry in {delay}s",
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 def validate_runtime() -> None:
     pipeline = CHECKPOINT_DIR / "pipeline.yaml"
     if not ROOT.is_dir():
@@ -1219,7 +1236,7 @@ def main() -> None:
     print(
         f"Fast-SAM3D persistent worker | GPUs={gpu_count} | base={BASE_URL}", flush=True
     )
-    hub_instance_id = preflight_hub()
+    hub_instance_id = wait_for_hub()
 
     ctx = mp.get_context("spawn")
     processes = [

@@ -402,6 +402,9 @@ def main():
     assert '/upload/masks' in fast_worker_text
     assert 'FAST_SAM3D_SAM2_ENABLED' in fast_notebook_text
     assert 'sam2.1_hiera_small.pt' in fast_notebook_text
+    assert 'wait_for_hub()' in fast_worker_text
+    assert 'Keepalive supervisor active' in fast_notebook_text
+    assert 'worker exited; restarting' in fast_notebook_text
 
     hunyuan_nb = root / "notebooks" / "008-hunyuan3d-2.1.ipynb"
     hunyuan_worker = root / "notebooks" / "hunyuan3d21_worker.py"
