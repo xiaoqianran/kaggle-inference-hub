@@ -44,6 +44,14 @@ MODEL_SPECS = {
         input_kind="image",
         output_kind="artifact",
     ),
+    "hunyuan3d-2.1": ModelSpec(
+        id="hunyuan3d-2.1",
+        label="Hunyuan3D 2.1",
+        default_steps=20,
+        description="image to PBR GLB · shape + paint · dual T4 worker",
+        input_kind="image",
+        output_kind="artifact",
+    ),
 }
 
 MODEL_ALIASES = {
@@ -57,6 +65,10 @@ MODEL_ALIASES = {
     "fastsam3d": "fast-sam3d",
     "fast-sam-3d": "fast-sam3d",
     "sam3d": "fast-sam3d",
+    "hunyuan2.1": "hunyuan3d-2.1",
+    "hunyuan21": "hunyuan3d-2.1",
+    "hunyuan3d21": "hunyuan3d-2.1",
+    "hunyuan-2.1": "hunyuan3d-2.1",
 }
 
 DEFAULT_MODEL = "sana-sprint-1.6b"

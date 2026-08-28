@@ -109,6 +109,18 @@ export type FastSam3DSubmission =
   | { kind: 'file'; file: File; mask: File; settings: FastSam3DSettings }
   | { kind: 'source'; sourceUrl: string; mask: File; settings: FastSam3DSettings }
 
+export type Hunyuan3DSettings = {
+  shapeSteps: number
+  octreeResolution: 128 | 256 | 384 | 512
+  paintViews: number
+  paintResolution: 128 | 256 | 384 | 512
+  textureSize: 512 | 1024 | 2048 | 4096
+}
+
+export type Hunyuan3DSubmission =
+  | { kind: 'file'; file: File; settings: Hunyuan3DSettings }
+  | { kind: 'source'; sourceUrl: string; settings: Hunyuan3DSettings }
+
 export type Worker = {
   worker_id: string
   model: string

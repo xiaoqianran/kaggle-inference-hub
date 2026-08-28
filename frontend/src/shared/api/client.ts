@@ -2,6 +2,7 @@ import type {
   BatchTaskRequest,
   FastSam3DSubmission,
   HistoryItem,
+  Hunyuan3DSubmission,
   HubStatus,
   ModelSpec,
   PromptBatchResult,
@@ -135,6 +136,26 @@ export function queueFastSam3DTask(token: string, submission: FastSam3DSubmissio
   }
 
   return requestJson('/task/fast-sam3d', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  })
+}
+export function queueHunyuan3DTask(token: string, submission: Hunyuan3DSubmission): Promise<QueueResponse> {
+  const form = new FormData()
+  form.append('shape_steps', String(submission.settings.shapeSteps))
+  form.append('octree_resolution', String(submission.settings.octreeResolution))
+  form.append('paint_views', String(submission.settings.paintViews))
+  form.append('paint_resolution', String(submission.settings.paintResolution))
+  form.append('texture_size', String(submission.settings.textureSize))
+
+  if (submission.kind === 'file') {
+    form.append('file', submission.file, submission.file.name)
+  } else {
+    form.append('source_url', submission.sourceUrl)
+  }
+
+  return requestJson('/task/hunyuan3d-2.1', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: form,

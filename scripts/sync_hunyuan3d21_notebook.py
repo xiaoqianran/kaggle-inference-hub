@@ -65,6 +65,30 @@ def main() -> None:
                 "    '/kaggle/working/hunyuan3d21_worker.py',\n"
                 "], check=True, timeout=2700)\n",
             ),
+            code_cell(
+                "hy21-hub-worker",
+                "import os, subprocess\n"
+                "from pathlib import Path\n"
+                "BASE_URL = os.getenv('KAGGLE_HUB_BASE_URL', 'https://ranran-sana.202820.xyz').rstrip('/')\n"
+                "TOKEN = os.getenv('KAGGLE_HUB_TOKEN', '')\n"
+                "if not TOKEN:\n"
+                "    try:\n"
+                "        from kaggle_secrets import UserSecretsClient\n"
+                "        TOKEN = UserSecretsClient().get_secret('KAGGLE_HUB_TOKEN') or ''\n"
+                "    except Exception:\n"
+                "        TOKEN = ''\n"
+                "if not TOKEN:\n"
+                "    print('ℹ️ KAGGLE_HUB_TOKEN 未配置：Hunyuan3D 2.1 自检已完成，跳过常驻 Hub Worker。')\n"
+                "else:\n"
+                "    log = Path('/kaggle/working/hunyuan3d21-worker.log')\n"
+                "    pid_file = Path('/kaggle/working/hunyuan3d21-worker.pid')\n"
+                "    env = os.environ.copy()\n"
+                "    env.update({'BASE_URL': BASE_URL, 'KAGGLE_HUB_TOKEN': TOKEN, 'HUNYUAN3D21_HUB_MODE': '1', 'PYTHONUNBUFFERED': '1'})\n"
+                "    handle = log.open('ab', buffering=0)\n"
+                "    process = subprocess.Popen(['/kaggle/working/hy21-venv/bin/python', '/kaggle/working/hunyuan3d21_worker.py'], env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)\n"
+                "    pid_file.write_text(str(process.pid))\n"
+                "    print('✅ Hunyuan3D 2.1 Hub worker started | PID', process.pid, '| log', log)\n",
+            ),
             markdown_cell(
                 "hy21-validation",
                 "## 验收\n\n"

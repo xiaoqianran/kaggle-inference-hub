@@ -451,6 +451,83 @@ async def add_triposr_task(
     }
 
 
+@app.post("/task/hunyuan3d-2.1", status_code=202)
+async def add_hunyuan3d21_task(
+    file: UploadFile | None = File(None),
+    source_url: str = Form(""),
+    shape_steps: int = Form(20),
+    octree_resolution: int = Form(256),
+    paint_views: int = Form(4),
+    paint_resolution: int = Form(256),
+    texture_size: int = Form(2048),
+    authorization: str | None = Header(None),
+):
+    auth(authorization)
+    source_url = source_url.strip()
+    if (file is None) == (not source_url):
+        raise HTTPException(status_code=400, detail="Provide exactly one of file or source_url")
+    if not 1 <= shape_steps <= 50:
+        raise HTTPException(status_code=400, detail="shape_steps must be between 1 and 50")
+    if octree_resolution not in {128, 256, 384, 512}:
+        raise HTTPException(status_code=400, detail="octree_resolution must be one of 128, 256, 384, 512")
+    if not 1 <= paint_views <= 8:
+        raise HTTPException(status_code=400, detail="paint_views must be between 1 and 8")
+    if paint_resolution not in {128, 256, 384, 512}:
+        raise HTTPException(status_code=400, detail="paint_resolution must be one of 128, 256, 384, 512")
+    if texture_size not in {512, 1024, 2048, 4096}:
+        raise HTTPException(status_code=400, detail="texture_size must be one of 512, 1024, 2048, 4096")
+
+    task_id = state.next_id()
+    owned_input = False
+    if file is not None:
+        data = await file.read(INPUT_MAX_BYTES + 1)
+        if len(data) > INPUT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Input image is too large")
+        suffix = image_suffix(data)
+        if suffix is None:
+            raise HTTPException(status_code=400, detail="Input must be PNG, JPEG, or WebP")
+        input_dir = OUTPUT_DIR / "_inputs"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        input_path = input_dir / f"hunyuan3d21_{int(time.time()*1000)}_{task_id:06d}{suffix}"
+        await asyncio.to_thread(input_path.write_bytes, data)
+        source_label = Path(file.filename or f"upload{suffix}").name
+        public_source_url = f"/outputs/_inputs/{input_path.name}"
+        owned_input = True
+    else:
+        input_path = local_output_path(source_url)
+        source_label = input_path.name
+        public_source_url = urlsplit(source_url).path
+
+    task = {
+        "id": task_id,
+        "model": "hunyuan3d-2.1",
+        "input_url": f"/task/input/{task_id}",
+        "source_url": public_source_url,
+        "source_label": source_label,
+        "output_format": "glb",
+        "shape_steps": shape_steps,
+        "octree_resolution": octree_resolution,
+        "paint_views": paint_views,
+        "paint_resolution": paint_resolution,
+        "texture_size": texture_size,
+        "created_at": time.time(),
+        "attempt": 0,
+        "_input_path": str(input_path.resolve()),
+        "_owned_input": owned_input,
+    }
+    try:
+        state.enqueue(task)
+    except queue.Full:
+        if owned_input:
+            input_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail="Task queue is full: hunyuan3d-2.1")
+    return {
+        "queued": 1,
+        "queue_size": state.queue_size("hunyuan3d-2.1"),
+        "task": {key: value for key, value in task.items() if not key.startswith("_")},
+    }
+
+
 @app.post("/task/fast-sam3d", status_code=202)
 async def add_fast_sam3d_task(
     mask: UploadFile = File(...),

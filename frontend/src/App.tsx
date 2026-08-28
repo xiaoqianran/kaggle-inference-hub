@@ -8,7 +8,7 @@ import { ModelTopbar } from '@/features/status/model-topbar'
 import { WorkspaceHeader, type WorkspaceKind } from '@/features/status/workspace-header'
 import { useHubSocket } from '@/hooks/use-hub-socket'
 import { historyQuery, modelsQuery, promptPipelineQuery, statusQuery } from '@/shared/api/queries'
-import type { FastSam3DSettings, TripoSettings } from '@/shared/api/types'
+import type { FastSam3DSettings, Hunyuan3DSettings, TripoSettings } from '@/shared/api/types'
 
 const DEFAULT_MODEL = 'sana-sprint-1.6b'
 const GenerationPanel = lazy(async () => {
@@ -26,6 +26,10 @@ const TripoPanel = lazy(async () => {
 const FastSam3DPanel = lazy(async () => {
   const module = await import('@/features/fast-sam3d/fast-sam3d-panel')
   return { default: module.FastSam3DPanel }
+})
+const Hunyuan3DPanel = lazy(async () => {
+  const module = await import('@/features/hunyuan3d/hunyuan3d-panel')
+  return { default: module.Hunyuan3DPanel }
 })
 const VideoWorkspace = lazy(async () => {
   const module = await import('@/features/video/video-workspace')
@@ -49,6 +53,13 @@ export default function App() {
     removeBackground: true,
   })
   const [fastSam3DSettings, setFastSam3DSettings] = useState<FastSam3DSettings>({ seed: 42 })
+  const [hunyuan3DSettings, setHunyuan3DSettings] = useState<Hunyuan3DSettings>({
+    shapeSteps: 20,
+    octreeResolution: 256,
+    paintViews: 4,
+    paintResolution: 256,
+    textureSize: 2048,
+  })
 
   const models = useQuery(modelsQuery)
   const pipeline = useQuery(promptPipelineQuery)
@@ -149,6 +160,13 @@ export default function App() {
                   token={token}
                   settings={fastSam3DSettings}
                   onSettingsChange={setFastSam3DSettings}
+                  status={status.data}
+                />
+              ) : currentArtifactModel.id === 'hunyuan3d-2.1' ? (
+                <Hunyuan3DPanel
+                  token={token}
+                  settings={hunyuan3DSettings}
+                  onSettingsChange={setHunyuan3DSettings}
                   status={status.data}
                 />
               ) : (

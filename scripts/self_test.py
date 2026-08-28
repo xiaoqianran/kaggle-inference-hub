@@ -218,15 +218,61 @@ def test_http_protocol(directory: Path) -> None:
         status = client.get("/api/status").json()
         assert status["storage"] == "sqlite" and status["inflight"] == 0
 
+        hunyuan_queued = client.post(
+            "/task/hunyuan3d-2.1",
+            headers=headers,
+            data={
+                "shape_steps": "20",
+                "octree_resolution": "256",
+                "paint_views": "4",
+                "paint_resolution": "256",
+                "texture_size": "2048",
+            },
+            files={"file": ("robot.png", png, "image/png")},
+        )
+        assert hunyuan_queued.status_code == 202, hunyuan_queued.text
+        hunyuan_task_id = hunyuan_queued.json()["task"]["id"]
+        hunyuan_claimed = client.post(
+            "/task/claim",
+            headers=headers,
+            json={"model": "hunyuan3d-2.1", "worker_id": "hy21-http", "wait_seconds": 0},
+        )
+        assert hunyuan_claimed.status_code == 200, hunyuan_claimed.text
+        hunyuan_task = hunyuan_claimed.json()
+        assert hunyuan_task["id"] == hunyuan_task_id
+        assert hunyuan_task["shape_steps"] == 20
+        assert hunyuan_task["output_format"] == "glb"
+        assert client.get(hunyuan_task["input_url"], headers=headers).content == png
+
+        hunyuan_nonce = os.urandom(12)
+        hunyuan_encrypted = hunyuan_nonce + AESGCM(key).encrypt(hunyuan_nonce, glb, None)
+        hunyuan_uploaded = client.post(
+            "/upload/artifact",
+            headers=headers,
+            data={
+                "id": str(hunyuan_task_id),
+                "gpu": "0",
+                "model": "hunyuan3d-2.1",
+                "worker_id": "hy21-http",
+                "output_format": "glb",
+            },
+            files={"file": ("hy21.glb.bin", hunyuan_encrypted, "application/octet-stream")},
+        )
+        assert hunyuan_uploaded.status_code == 200, hunyuan_uploaded.text
+        assert hunyuan_uploaded.json()["model"] == "hunyuan3d-2.1"
+
 
 def main():
     assert canonical_model("sana") == "sana-sprint-1.6b"
     assert canonical_model("zimage") == "z-image-turbo-gguf"
     assert canonical_model("tripo-sr") == "triposr"
     assert canonical_model("sam3d") == "fast-sam3d"
+    assert canonical_model("hunyuan2.1") == "hunyuan3d-2.1"
     assert MODEL_SPECS["triposr"].input_kind == "image"
     assert MODEL_SPECS["fast-sam3d"].input_kind == "image"
     assert MODEL_SPECS["fast-sam3d"].output_kind == "artifact"
+    assert MODEL_SPECS["hunyuan3d-2.1"].input_kind == "image"
+    assert MODEL_SPECS["hunyuan3d-2.1"].output_kind == "artifact"
 
     with tempfile.TemporaryDirectory(prefix="kaggle-hub-test-") as directory:
         test_root = Path(directory)
@@ -276,14 +322,29 @@ def main():
     assert 'MODEL = "fast-sam3d"' in fast_worker_text
     assert 'mp.get_context("spawn")' in fast_worker_text
     assert '"active_task_id": active_task["id"]' in fast_worker_text
-    assert 'output = inference(image, mask, seed=seed)' in fast_worker_text
+    assert 'return inference(image, mask, seed=seed)' in fast_worker_text
     assert 'Fast-SAM3D · Kaggle 双 T4 常驻 Worker' in fast_notebook_text
     assert 'update-alternatives' not in fast_notebook_text
     assert 'KAGGLE_HUB_TOKEN' in fast_notebook_text
 
+    hunyuan_nb = root / "notebooks" / "008-hunyuan3d-2.1.ipynb"
+    hunyuan_worker = root / "notebooks" / "hunyuan3d21_worker.py"
+    assert hunyuan_nb.is_file() and hunyuan_worker.is_file()
+    hunyuan_notebook = json.loads(hunyuan_nb.read_text(encoding="utf-8"))
+    hunyuan_notebook_text = "\n".join(
+        "".join(cell.get("source", [])) for cell in hunyuan_notebook["cells"]
+    )
+    hunyuan_worker_text = hunyuan_worker.read_text(encoding="utf-8")
+    assert embedded_worker(hunyuan_notebook) == hunyuan_worker_text
+    assert 'MODEL = "hunyuan3d-2.1"' in hunyuan_worker_text
+    assert '/task/claim' in hunyuan_worker_text
+    assert '/upload/artifact' in hunyuan_worker_text
+    assert '"active_task_id": active_task["id"]' in hunyuan_worker_text
+    assert 'HUNYUAN3D21_HUB_MODE' in hunyuan_notebook_text
+
     print(
         "OK: SQLite cross-process queue + atomic claims + durable leases/history + "
-        "AES-GCM + synchronized persistent dual-GPU TripoSR/Fast-SAM3D workers"
+        "AES-GCM + synchronized persistent TripoSR/Fast-SAM3D/Hunyuan3D workers"
     )
 
 
