@@ -163,6 +163,19 @@ def server_snapshot(session: requests.Session) -> dict[str, Any]:
     return response.json()
 
 
+def hub_supports_mask_service(session: requests.Session) -> bool:
+    try:
+        response = session.get(
+            api_url("/openapi.json"), params={"_ts": time.time_ns()}, timeout=15
+        )
+        checked_response(response, "GET /openapi.json")
+        paths = response.json().get("paths", {})
+        return "/mask/auto" in paths and "/upload/masks" in paths
+    except Exception as exc:  # noqa: BLE001 - capability probe must never stop 3D work
+        print(f"[SAM2] Hub mask capability probe failed: {type(exc).__name__}: {exc}", flush=True)
+        return False
+
+
 def preflight_hub() -> str:
     session = requests.Session()
     session.headers.update(auth_headers())
@@ -1074,6 +1087,13 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
 
     session = requests.Session()
     session.headers.update(auth_headers())
+    mask_protocol_ready = mask_generator is not None and hub_supports_mask_service(session)
+    if mask_generator is not None:
+        print(
+            f"[SAM2] Hub mask protocol {'READY' if mask_protocol_ready else 'PENDING'}; "
+            "Fast-SAM3D 3D queue remains available",
+            flush=True,
+        )
     register_response = session.post(
         api_url("/worker/register"),
         json={
@@ -1119,8 +1139,17 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
             task: dict[str, Any] | None = None
             try:
                 # Mask generation is interactive, so check it before the longer 3D queue poll.
-                if mask_generator is not None:
-                    task = claim_task(session, MASK_MODEL, worker_id, hub_instance_id, 0)
+                # An older Hub must never block the existing Fast-SAM3D 3D queue.
+                if mask_generator is not None and mask_protocol_ready:
+                    try:
+                        task = claim_task(session, MASK_MODEL, worker_id, hub_instance_id, 0)
+                    except RuntimeError as exc:
+                        mask_protocol_ready = False
+                        print(
+                            f"[SAM2] Hub mask protocol became unavailable: {exc}; continuing 3D only",
+                            flush=True,
+                        )
+                        task = None
                 if task is None:
                     task = claim_task(session, MODEL, worker_id, hub_instance_id, 5)
                 if task is None:
@@ -1128,11 +1157,16 @@ def gpu_worker(gpu: int, run_id: str, hub_instance_id: str) -> None:
                     if now - last_idle_diagnostic >= IDLE_DIAGNOSTIC_SECONDS:
                         last_idle_diagnostic = now
                         snapshot = server_snapshot(session)
+                        if mask_generator is not None and not mask_protocol_ready:
+                            mask_protocol_ready = hub_supports_mask_service(session)
+                            if mask_protocol_ready:
+                                print("[SAM2] Hub mask protocol is now READY; enabling mask queue", flush=True)
                         queued_3d = int(snapshot.get("queued_by_model", {}).get(MODEL, 0) or 0)
                         queued_mask = int(snapshot.get("queued_by_model", {}).get(MASK_MODEL, 0) or 0)
                         inflight_3d = int(snapshot.get("inflight_by_model", {}).get(MODEL, 0) or 0)
                         print(
                             f"[GPU{gpu}] idle | 3d={queued_3d}/{inflight_3d} mask={queued_mask} "
+                            f"mask_protocol={'ready' if mask_protocol_ready else 'pending'} "
                             f"instance={str(snapshot.get('hub_instance_id', ''))[:12]}",
                             flush=True,
                         )
