@@ -16,7 +16,7 @@ type ResultCardProps = {
   item: HistoryItem
   modelLabel: string
   onConvertTo3d?: (sourceUrl: string) => void
-  isConverting?: boolean
+  convertModelLabel?: string
 }
 
 const resultDateFormatter = new Intl.DateTimeFormat('zh-CN', {
@@ -26,7 +26,7 @@ const resultDateFormatter = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
 })
 
-export function ResultCard({ item, modelLabel, onConvertTo3d, isConverting = false }: ResultCardProps) {
+export function ResultCard({ item, modelLabel, onConvertTo3d, convertModelLabel }: ResultCardProps) {
   const createdAt = resultDateFormatter.format(new Date(item.time * 1000))
   const [previewOpen, setPreviewOpen] = useState(false)
   const [imagePreviewOpen, setImagePreviewOpen] = useState(false)
@@ -39,7 +39,7 @@ export function ResultCard({ item, modelLabel, onConvertTo3d, isConverting = fal
           {item.source_url ? (
             <img
               src={`${item.source_url}?t=${item.time}`}
-              alt={item.source_label ?? 'TripoSR input'}
+              alt={item.source_label ?? '3D input'}
               loading="lazy"
               decoding="async"
               className="size-full object-cover transition duration-500 group-hover:scale-[1.02]"
@@ -141,9 +141,10 @@ export function ResultCard({ item, modelLabel, onConvertTo3d, isConverting = fal
             variant="secondary"
             size="sm"
             onClick={() => onConvertTo3d?.(item.url)}
-            disabled={!onConvertTo3d || isConverting}
+            disabled={!onConvertTo3d}
+            title={convertModelLabel ? `使用 ${convertModelLabel} 转 3D` : undefined}
           >
-            <Box className="size-3.5" /> {isConverting ? '提交中…' : '转 3D'}
+            <Box className="size-3.5" /> 转 3D
           </Button>
         </div>
       </CardContent>

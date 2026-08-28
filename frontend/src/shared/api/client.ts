@@ -1,8 +1,7 @@
 import type {
+  ArtifactSubmission,
   BatchTaskRequest,
-  FastSam3DSubmission,
   HistoryItem,
-  Hunyuan3DSubmission,
   HubStatus,
   ModelSpec,
   PromptBatchResult,
@@ -11,7 +10,6 @@ import type {
   PromptProcessResult,
   QueueResponse,
   SingleTaskRequest,
-  TripoSubmission,
 } from '@/shared/api/types'
 
 export class ApiError extends Error {
@@ -103,59 +101,19 @@ export function queueBatchTasks(token: string, input: BatchTaskRequest): Promise
   })
 }
 
-export function queueTripoTask(token: string, submission: TripoSubmission): Promise<QueueResponse> {
+export function queueArtifactTask(token: string, submission: ArtifactSubmission): Promise<QueueResponse> {
   const form = new FormData()
-  form.append('output_format', submission.settings.outputFormat)
-  form.append('mc_resolution', String(submission.settings.resolution))
-  form.append('chunk_size', '8192')
-  form.append('foreground_ratio', '0.85')
-  form.append('remove_background', String(submission.settings.removeBackground))
-
-  if (submission.kind === 'file') {
-    form.append('file', submission.file, submission.file.name)
+  form.append('options', JSON.stringify(submission.options))
+  if (submission.source.kind === 'file') {
+    form.append('file', submission.source.file, submission.source.file.name)
   } else {
-    form.append('source_url', submission.sourceUrl)
+    form.append('source_url', submission.source.sourceUrl)
+  }
+  for (const [name, file] of Object.entries(submission.auxiliaryFiles ?? {})) {
+    form.append(name, file, file.name)
   }
 
-  return requestJson('/task/triposr', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
-  })
-}
-
-export function queueFastSam3DTask(token: string, submission: FastSam3DSubmission): Promise<QueueResponse> {
-  const form = new FormData()
-  form.append('mask', submission.mask, submission.mask.name)
-  form.append('seed', String(submission.settings.seed))
-
-  if (submission.kind === 'file') {
-    form.append('file', submission.file, submission.file.name)
-  } else {
-    form.append('source_url', submission.sourceUrl)
-  }
-
-  return requestJson('/task/fast-sam3d', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
-  })
-}
-export function queueHunyuan3DTask(token: string, submission: Hunyuan3DSubmission): Promise<QueueResponse> {
-  const form = new FormData()
-  form.append('shape_steps', String(submission.settings.shapeSteps))
-  form.append('octree_resolution', String(submission.settings.octreeResolution))
-  form.append('paint_views', String(submission.settings.paintViews))
-  form.append('paint_resolution', String(submission.settings.paintResolution))
-  form.append('texture_size', String(submission.settings.textureSize))
-
-  if (submission.kind === 'file') {
-    form.append('file', submission.file, submission.file.name)
-  } else {
-    form.append('source_url', submission.sourceUrl)
-  }
-
-  return requestJson('/task/hunyuan3d-2.1', {
+  return requestJson(`/task/artifact/${encodeURIComponent(submission.model)}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: form,

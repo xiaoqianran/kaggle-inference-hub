@@ -1,3 +1,29 @@
+export type ArtifactOptionValue = string | number | boolean
+
+export type ArtifactOptionSpec = {
+  id: string
+  label: string
+  kind: 'select' | 'integer' | 'number' | 'boolean'
+  default: ArtifactOptionValue
+  choices: ArtifactOptionValue[]
+  minimum: number | null
+  maximum: number | null
+  help: string
+  visible: boolean
+}
+
+export type ArtifactInputSpec = {
+  id: string
+  label: string
+  help: string
+  required: boolean
+}
+
+export type ArtifactModelSpec = {
+  options: ArtifactOptionSpec[]
+  auxiliary_inputs: ArtifactInputSpec[]
+}
+
 export type ModelSpec = {
   id: string
   label: string
@@ -5,6 +31,7 @@ export type ModelSpec = {
   description: string
   input_kind: 'prompt' | 'image'
   output_kind: 'image' | 'artifact'
+  artifact: ArtifactModelSpec | null
 }
 
 export type PromptMode = {
@@ -91,35 +118,16 @@ export type QueueResponse = {
   tasks?: QueuedTask[]
 }
 
-export type TripoSettings = {
-  outputFormat: 'glb' | 'obj'
-  resolution: 128 | 256 | 384 | 512
-  removeBackground: boolean
+export type ArtifactSource =
+  | { kind: 'file'; file: File }
+  | { kind: 'source'; sourceUrl: string }
+
+export type ArtifactSubmission = {
+  model: string
+  source: ArtifactSource
+  options: Record<string, ArtifactOptionValue>
+  auxiliaryFiles?: Record<string, File>
 }
-
-export type TripoSubmission =
-  | { kind: 'file'; file: File; settings: TripoSettings }
-  | { kind: 'source'; sourceUrl: string; settings: TripoSettings }
-
-export type FastSam3DSettings = {
-  seed: number
-}
-
-export type FastSam3DSubmission =
-  | { kind: 'file'; file: File; mask: File; settings: FastSam3DSettings }
-  | { kind: 'source'; sourceUrl: string; mask: File; settings: FastSam3DSettings }
-
-export type Hunyuan3DSettings = {
-  shapeSteps: number
-  octreeResolution: 128 | 256 | 384 | 512
-  paintViews: number
-  paintResolution: 128 | 256 | 384 | 512
-  textureSize: 512 | 1024 | 2048 | 4096
-}
-
-export type Hunyuan3DSubmission =
-  | { kind: 'file'; file: File; settings: Hunyuan3DSettings }
-  | { kind: 'source'; sourceUrl: string; settings: Hunyuan3DSettings }
 
 export type Worker = {
   worker_id: string

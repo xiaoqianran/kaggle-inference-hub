@@ -26,3 +26,6 @@ sana_received/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local code intelligence
+.codegraph/

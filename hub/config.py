@@ -2,7 +2,38 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import TypeAlias
 from pathlib import Path
+
+
+ArtifactOptionValue: TypeAlias = str | int | float | bool
+
+
+@dataclass(frozen=True)
+class ArtifactOptionSpec:
+    id: str
+    label: str
+    kind: str
+    default: ArtifactOptionValue
+    choices: tuple[ArtifactOptionValue, ...] = ()
+    minimum: float | None = None
+    maximum: float | None = None
+    help: str = ""
+    visible: bool = True
+
+
+@dataclass(frozen=True)
+class ArtifactInputSpec:
+    id: str
+    label: str
+    help: str = ""
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class ArtifactSpec:
+    options: tuple[ArtifactOptionSpec, ...] = ()
+    auxiliary_inputs: tuple[ArtifactInputSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -13,6 +44,7 @@ class ModelSpec:
     description: str
     input_kind: str = "prompt"
     output_kind: str = "image"
+    artifact: ArtifactSpec | None = None
 
 
 MODEL_SPECS = {
@@ -35,6 +67,29 @@ MODEL_SPECS = {
         description="single image to GLB/OBJ · dual T4 worker",
         input_kind="image",
         output_kind="artifact",
+        artifact=ArtifactSpec(
+            options=(
+                ArtifactOptionSpec("output_format", "输出格式", "select", "glb", ("glb", "obj")),
+                ArtifactOptionSpec("mc_resolution", "MC Resolution", "select", 256, (128, 256, 384, 512)),
+                ArtifactOptionSpec(
+                    "remove_background",
+                    "自动移除背景",
+                    "boolean",
+                    True,
+                    help="缩放并居中单个主体",
+                ),
+                ArtifactOptionSpec("chunk_size", "Chunk Size", "integer", 8192, minimum=1024, maximum=131072, visible=False),
+                ArtifactOptionSpec(
+                    "foreground_ratio",
+                    "Foreground Ratio",
+                    "number",
+                    0.85,
+                    minimum=0.5,
+                    maximum=1.0,
+                    visible=False,
+                ),
+            )
+        ),
     ),
     "fast-sam3d": ModelSpec(
         id="fast-sam3d",
@@ -43,6 +98,15 @@ MODEL_SPECS = {
         description="masked image to GLB · persistent dual T4 worker",
         input_kind="image",
         output_kind="artifact",
+        artifact=ArtifactSpec(
+            options=(
+                ArtifactOptionSpec("seed", "Seed", "integer", 42, minimum=0, maximum=2_147_483_647),
+                ArtifactOptionSpec("output_format", "输出格式", "select", "glb", ("glb",), visible=False),
+            ),
+            auxiliary_inputs=(
+                ArtifactInputSpec("mask", "Mask", "与 RGB 同尺寸的非空 mask；建议 PNG 黑白图"),
+            ),
+        ),
     ),
     "hunyuan3d-2.1": ModelSpec(
         id="hunyuan3d-2.1",
@@ -51,6 +115,23 @@ MODEL_SPECS = {
         description="image to PBR GLB · shape + paint · dual T4 worker",
         input_kind="image",
         output_kind="artifact",
+        artifact=ArtifactSpec(
+            options=(
+                ArtifactOptionSpec("shape_steps", "Shape Steps", "integer", 20, minimum=1, maximum=50),
+                ArtifactOptionSpec("octree_resolution", "Octree", "select", 256, (128, 256, 384, 512)),
+                ArtifactOptionSpec("paint_views", "Paint Views", "select", 4, (2, 4, 6, 8)),
+                ArtifactOptionSpec("texture_size", "Texture", "select", 2048, (1024, 2048, 4096)),
+                ArtifactOptionSpec(
+                    "paint_resolution",
+                    "Paint Resolution",
+                    "select",
+                    256,
+                    (128, 256, 384, 512),
+                    visible=False,
+                ),
+                ArtifactOptionSpec("output_format", "输出格式", "select", "glb", ("glb",), visible=False),
+            )
+        ),
     ),
 }
 

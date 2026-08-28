@@ -8,7 +8,6 @@ import { ModelTopbar } from '@/features/status/model-topbar'
 import { WorkspaceHeader, type WorkspaceKind } from '@/features/status/workspace-header'
 import { useHubSocket } from '@/hooks/use-hub-socket'
 import { historyQuery, modelsQuery, promptPipelineQuery, statusQuery } from '@/shared/api/queries'
-import type { FastSam3DSettings, Hunyuan3DSettings, TripoSettings } from '@/shared/api/types'
 
 const DEFAULT_MODEL = 'sana-sprint-1.6b'
 const GenerationPanel = lazy(async () => {
@@ -19,17 +18,9 @@ const ControlCenterSheet = lazy(async () => {
   const module = await import('@/features/status/control-center-sheet')
   return { default: module.ControlCenterSheet }
 })
-const TripoPanel = lazy(async () => {
-  const module = await import('@/features/triposr/triposr-panel')
-  return { default: module.TripoPanel }
-})
-const FastSam3DPanel = lazy(async () => {
-  const module = await import('@/features/fast-sam3d/fast-sam3d-panel')
-  return { default: module.FastSam3DPanel }
-})
-const Hunyuan3DPanel = lazy(async () => {
-  const module = await import('@/features/hunyuan3d/hunyuan3d-panel')
-  return { default: module.Hunyuan3DPanel }
+const ImageToArtifactPanel = lazy(async () => {
+  const module = await import('@/features/artifacts/image-to-artifact-panel')
+  return { default: module.ImageToArtifactPanel }
 })
 const VideoWorkspace = lazy(async () => {
   const module = await import('@/features/video/video-workspace')
@@ -44,22 +35,13 @@ export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('kaggle_hub_token') ?? '')
   const [workspace, setWorkspace] = useState<WorkspaceKind>('image')
   const [controlCenterOpen, setControlCenterOpen] = useState(false)
-  const [selectedModel, setSelectedModel] = useState(
-    () => localStorage.getItem('kaggle_hub_model') ?? DEFAULT_MODEL,
+  const [selectedImageModel, setSelectedImageModel] = useState(
+    () => localStorage.getItem('kaggle_hub_image_model') ?? DEFAULT_MODEL,
   )
-  const [tripoSettings, setTripoSettings] = useState<TripoSettings>({
-    outputFormat: 'glb',
-    resolution: 256,
-    removeBackground: true,
-  })
-  const [fastSam3DSettings, setFastSam3DSettings] = useState<FastSam3DSettings>({ seed: 42 })
-  const [hunyuan3DSettings, setHunyuan3DSettings] = useState<Hunyuan3DSettings>({
-    shapeSteps: 20,
-    octreeResolution: 256,
-    paintViews: 4,
-    paintResolution: 256,
-    textureSize: 2048,
-  })
+  const [selectedArtifactModel, setSelectedArtifactModel] = useState(
+    () => localStorage.getItem('kaggle_hub_artifact_model') ?? 'triposr',
+  )
+  const [artifactSourceUrl, setArtifactSourceUrl] = useState<string>()
 
   const models = useQuery(modelsQuery)
   const pipeline = useQuery(promptPipelineQuery)
@@ -73,8 +55,8 @@ export default function App() {
 
   const imageModels = models.data?.filter((model) => model.output_kind === 'image') ?? []
   const artifactModels = models.data?.filter((model) => model.output_kind === 'artifact') ?? []
-  const currentModel = imageModels.find((model) => model.id === selectedModel) ?? imageModels[0]
-  const currentArtifactModel = artifactModels.find((model) => model.id === selectedModel) ?? artifactModels[0]
+  const currentModel = imageModels.find((model) => model.id === selectedImageModel) ?? imageModels[0]
+  const currentArtifactModel = artifactModels.find((model) => model.id === selectedArtifactModel) ?? artifactModels[0]
   const resultCounts = useMemo(() => {
     const counts: Record<string, number> = {}
     for (const item of history.data ?? []) counts[item.model] = (counts[item.model] ?? 0) + 1
@@ -82,9 +64,24 @@ export default function App() {
   }, [history.data])
   const historyItems = history.data ?? []
 
-  const updateModel = (model: string) => {
-    setSelectedModel(model)
-    localStorage.setItem('kaggle_hub_model', model)
+  const updateImageModel = (model: string) => {
+    setSelectedImageModel(model)
+    localStorage.setItem('kaggle_hub_image_model', model)
+  }
+
+  const updateArtifactModel = (model: string) => {
+    setSelectedArtifactModel(model)
+    localStorage.setItem('kaggle_hub_artifact_model', model)
+  }
+
+  const updateWorkspaceModel = (model: string) => {
+    if (workspace === '3d') updateArtifactModel(model)
+    else if (workspace === 'image') updateImageModel(model)
+  }
+
+  const prepareImageTo3d = (sourceUrl: string) => {
+    setArtifactSourceUrl(sourceUrl)
+    setWorkspace('3d')
   }
 
   const startupError = models.error ?? pipeline.error ?? status.error ?? history.error
@@ -107,8 +104,8 @@ export default function App() {
       <ModelTopbar
         workspace={workspace}
         models={models.data ?? []}
-        selectedModel={workspace === '3d' ? currentArtifactModel?.id ?? 'triposr' : currentModel?.id ?? selectedModel}
-        onSelectedModelChange={updateModel}
+        selectedModel={workspace === '3d' ? currentArtifactModel?.id ?? selectedArtifactModel : currentModel?.id ?? selectedImageModel}
+        onSelectedModelChange={updateWorkspaceModel}
         status={status.data}
         resultCounts={resultCounts}
       />
@@ -144,8 +141,10 @@ export default function App() {
               workspace="image"
               items={imageItems}
               model={currentModel}
-              token={token}
-              tripoSettings={tripoSettings}
+              conversionModels={artifactModels}
+              conversionModel={currentArtifactModel}
+              onConversionModelChange={updateArtifactModel}
+              onConvertTo3d={prepareImageTo3d}
               isLoading={history.isLoading}
               isRefreshing={history.isFetching}
               onRefresh={() => void history.refetch()}
@@ -155,23 +154,14 @@ export default function App() {
         {workspace === '3d' && currentArtifactModel ? (
           <aside className="lg:sticky lg:top-20 lg:self-start">
             <Suspense fallback={<WorkspaceFallback />}>
-              {currentArtifactModel.id === 'fast-sam3d' ? (
-                <FastSam3DPanel
-                  token={token}
-                  settings={fastSam3DSettings}
-                  onSettingsChange={setFastSam3DSettings}
-                  status={status.data}
-                />
-              ) : currentArtifactModel.id === 'hunyuan3d-2.1' ? (
-                <Hunyuan3DPanel
-                  token={token}
-                  settings={hunyuan3DSettings}
-                  onSettingsChange={setHunyuan3DSettings}
-                  status={status.data}
-                />
-              ) : (
-                <TripoPanel token={token} settings={tripoSettings} onSettingsChange={setTripoSettings} status={status.data} />
-              )}
+              <ImageToArtifactPanel
+                key={currentArtifactModel.id}
+                model={currentArtifactModel}
+                token={token}
+                status={status.data}
+                sourceUrl={artifactSourceUrl}
+                onSourceUrlClear={() => setArtifactSourceUrl(undefined)}
+              />
             </Suspense>
           </aside>
         ) : null}
@@ -182,8 +172,6 @@ export default function App() {
               workspace="3d"
               items={artifactItems}
               model={currentArtifactModel}
-              token={token}
-              tripoSettings={tripoSettings}
               isLoading={history.isLoading}
               isRefreshing={history.isFetching}
               onRefresh={() => void history.refetch()}

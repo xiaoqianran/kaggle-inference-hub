@@ -4,16 +4,18 @@ import { useState } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ResultCard, ResultCardSkeleton } from '@/features/gallery/result-card'
-import { useSubmitTripo } from '@/features/triposr/use-submit-tripo'
 import type { WorkspaceKind } from '@/features/status/workspace-header'
-import type { HistoryItem, ModelSpec, TripoSettings } from '@/shared/api/types'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import type { HistoryItem, ModelSpec } from '@/shared/api/types'
 
 type GalleryProps = {
   workspace: Extract<WorkspaceKind, 'image' | '3d'>
   items: HistoryItem[]
   model?: ModelSpec
-  token: string
-  tripoSettings: TripoSettings
+  conversionModels?: ModelSpec[]
+  conversionModel?: ModelSpec
+  onConversionModelChange?: (model: string) => void
+  onConvertTo3d?: (sourceUrl: string) => void
   isLoading: boolean
   isRefreshing: boolean
   onRefresh: () => void
@@ -35,13 +37,14 @@ export function Gallery({
   workspace,
   items,
   model,
-  token,
-  tripoSettings,
+  conversionModels = [],
+  conversionModel,
+  onConversionModelChange,
+  onConvertTo3d,
   isLoading,
   isRefreshing,
   onRefresh,
 }: GalleryProps) {
-  const submitTripo = useSubmitTripo(token)
   const newestFirst = items.toReversed()
   const pageCount = Math.max(1, Math.ceil(newestFirst.length / PAGE_SIZE))
   const [currentPage, setCurrentPage] = useState(1)
@@ -60,13 +63,28 @@ export function Gallery({
             <Badge variant="secondary" className="font-mono text-[9px]">{items.length}</Badge>
           </div>
           <p className="mt-1 truncate text-xs text-muted-foreground">
-            {model?.label ?? (isImage ? '当前模型' : 'TripoSR')} · {isImage ? '仅显示这个模型的结果' : '可下载的 GLB / OBJ 重建结果'}
+            {model?.label ?? (isImage ? '当前模型' : '3D 模型')} · {isImage ? '仅显示这个模型的结果' : '可下载的 GLB / OBJ 重建结果'}
           </p>
         </div>
-        <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={isRefreshing}>
-          <RefreshCw className={`size-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
-          <span className="hidden sm:inline">刷新</span>
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {isImage && conversionModels.length ? (
+            <Select value={conversionModel?.id ?? ''} onValueChange={onConversionModelChange}>
+              <SelectTrigger className="h-8 w-[168px]" aria-label="选择图片转 3D 的目标模型">
+                <Box className="size-3.5 text-primary" />
+                <SelectValue placeholder="选择 3D 模型" />
+              </SelectTrigger>
+              <SelectContent>
+                {conversionModels.map((target) => (
+                  <SelectItem key={target.id} value={target.id}>{target.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          ) : null}
+          <Button type="button" variant="outline" size="sm" onClick={onRefresh} disabled={isRefreshing}>
+            <RefreshCw className={`size-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+            <span className="hidden sm:inline">刷新</span>
+          </Button>
+        </div>
       </div>
 
       {isLoading ? (
@@ -80,16 +98,8 @@ export function Gallery({
               key={item.event_id}
               item={item}
               modelLabel={model?.label ?? item.model}
-              onConvertTo3d={
-                item.kind === 'image'
-                  ? (sourceUrl) => submitTripo.mutate({ kind: 'source', sourceUrl, settings: tripoSettings })
-                  : undefined
-              }
-              isConverting={
-                submitTripo.isPending &&
-                submitTripo.variables?.kind === 'source' &&
-                submitTripo.variables.sourceUrl === (item.kind === 'image' ? item.url : '')
-              }
+              onConvertTo3d={item.kind === 'image' ? onConvertTo3d : undefined}
+              convertModelLabel={item.kind === 'image' ? conversionModel?.label : undefined}
             />
           ))}
         </div>

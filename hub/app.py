@@ -4,6 +4,8 @@ import asyncio
 import json
 import queue
 import time
+from dataclasses import asdict
+from typing import Any
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -34,7 +36,7 @@ from .crypto import decrypt_blob
 from .prompt_pipeline import PromptPipeline, PromptPipelineError, PromptPipelineSettings
 from .state import state
 
-app = FastAPI(title="Kaggle Inference Hub", version="0.5.0")
+app = FastAPI(title="Kaggle Inference Hub", version="0.6.0")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 WEB_DIR = Path(__file__).with_name("web")
 
@@ -175,9 +177,168 @@ def local_output_path(url: str) -> Path:
         raise HTTPException(status_code=404, detail="Source image does not exist")
     if candidate.stat().st_size > INPUT_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Source image is too large")
-    if image_suffix(candidate.read_bytes()[:16]) is None:
+    with candidate.open("rb") as handle:
+        head = handle.read(16)
+    if image_suffix(head) is None:
         raise HTTPException(status_code=400, detail="Source must be PNG, JPEG, or WebP")
     return candidate
+
+
+def artifact_model_or_400(value: str | None) -> str:
+    model = model_or_400(value)
+    spec = MODEL_SPECS[model]
+    if spec.input_kind != "image" or spec.output_kind != "artifact" or spec.artifact is None:
+        raise HTTPException(status_code=400, detail=f"Model is not an image-to-artifact model: {model}")
+    return model
+
+
+def validate_artifact_options(model: str, values: dict[str, Any] | None) -> dict[str, Any]:
+    spec = MODEL_SPECS[model].artifact
+    if spec is None:
+        raise HTTPException(status_code=400, detail=f"Model has no artifact task schema: {model}")
+    values = values or {}
+    fields = {option.id: option for option in spec.options}
+    unknown = sorted(set(values) - set(fields))
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown artifact options for {model}: {', '.join(unknown)}")
+
+    result: dict[str, Any] = {}
+    for option in spec.options:
+        value = values.get(option.id, option.default)
+        if option.kind == "boolean":
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=400, detail=f"{option.id} must be a boolean")
+        elif option.kind == "integer":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise HTTPException(status_code=400, detail=f"{option.id} must be an integer")
+        elif option.kind == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(status_code=400, detail=f"{option.id} must be a number")
+        elif option.kind == "select":
+            if value not in option.choices:
+                choices = ", ".join(map(str, option.choices))
+                raise HTTPException(status_code=400, detail=f"{option.id} must be one of: {choices}")
+        else:
+            raise HTTPException(status_code=500, detail=f"Invalid artifact option schema: {option.kind}")
+
+        if option.minimum is not None and isinstance(value, (int, float)) and value < option.minimum:
+            raise HTTPException(status_code=400, detail=f"{option.id} must be >= {option.minimum:g}")
+        if option.maximum is not None and isinstance(value, (int, float)) and value > option.maximum:
+            raise HTTPException(status_code=400, detail=f"{option.id} must be <= {option.maximum:g}")
+        result[option.id] = value
+    return result
+
+
+async def read_image_upload(upload: UploadFile, label: str) -> tuple[bytes, str]:
+    data = await upload.read(INPUT_MAX_BYTES + 1)
+    if len(data) > INPUT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"{label} is too large")
+    suffix = image_suffix(data)
+    if suffix is None:
+        raise HTTPException(status_code=400, detail=f"{label} must be PNG, JPEG, or WebP")
+    return data, suffix
+
+
+def artifact_input_dir() -> Path:
+    path = OUTPUT_DIR / "_inputs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def safe_model_prefix(model: str) -> str:
+    return "".join(char if char.isalnum() else "_" for char in model)
+
+
+async def store_image_upload(upload: UploadFile, *, prefix: str, task_id: int, label: str) -> tuple[Path, str]:
+    data, suffix = await read_image_upload(upload, label)
+    path = artifact_input_dir() / f"{prefix}_{int(time.time()*1000)}_{task_id:06d}{suffix}"
+    await asyncio.to_thread(path.write_bytes, data)
+    return path, suffix
+
+
+async def enqueue_artifact_task(
+    model: str,
+    *,
+    file: UploadFile | None,
+    source_url: str,
+    options: dict[str, Any] | None = None,
+    auxiliary_uploads: dict[str, UploadFile | None] | None = None,
+) -> dict[str, Any]:
+    model = artifact_model_or_400(model)
+    spec = MODEL_SPECS[model].artifact
+    assert spec is not None
+    source_url = source_url.strip()
+    if (file is None) == (not source_url):
+        raise HTTPException(status_code=400, detail="Provide exactly one of file or source_url")
+
+    auxiliary_uploads = auxiliary_uploads or {}
+    expected_aux = {item.id: item for item in spec.auxiliary_inputs}
+    unknown_aux = sorted(set(auxiliary_uploads) - set(expected_aux))
+    if unknown_aux:
+        raise HTTPException(status_code=400, detail=f"Unknown auxiliary inputs for {model}: {', '.join(unknown_aux)}")
+    for item in spec.auxiliary_inputs:
+        if item.required and auxiliary_uploads.get(item.id) is None:
+            raise HTTPException(status_code=400, detail=f"Missing required input: {item.id}")
+
+    task_options = validate_artifact_options(model, options)
+    task_id = state.next_id()
+    owned_paths: list[Path] = []
+    prefix = safe_model_prefix(model)
+    try:
+        if file is not None:
+            input_path, suffix = await store_image_upload(file, prefix=prefix, task_id=task_id, label="Input image")
+            owned_paths.append(input_path)
+            source_label = Path(file.filename or f"upload{suffix}").name
+            public_source_url = f"/outputs/_inputs/{input_path.name}"
+        else:
+            input_path = local_output_path(source_url)
+            source_label = input_path.name
+            public_source_url = urlsplit(source_url).path
+
+        task: dict[str, Any] = {
+            "id": task_id,
+            "model": model,
+            "input_url": f"/task/input/{task_id}",
+            "source_url": public_source_url,
+            "source_label": source_label,
+            **task_options,
+            "created_at": time.time(),
+            "attempt": 0,
+            "_input_path": str(input_path.resolve()),
+            "_owned_input": file is not None,
+        }
+
+        for item in spec.auxiliary_inputs:
+            upload = auxiliary_uploads.get(item.id)
+            if upload is None:
+                continue
+            aux_path, suffix = await store_image_upload(
+                upload,
+                prefix=f"{prefix}_{item.id}",
+                task_id=task_id,
+                label=item.label,
+            )
+            owned_paths.append(aux_path)
+            task[f"{item.id}_url"] = f"/task/aux/{task_id}/{item.id}"
+            task[f"{item.id}_label"] = Path(upload.filename or f"{item.id}{suffix}").name
+            task[f"_{item.id}_path"] = str(aux_path.resolve())
+            task[f"_owned_{item.id}"] = True
+
+        state.enqueue(task)
+    except queue.Full:
+        for path in owned_paths:
+            path.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail=f"Task queue is full: {model}")
+    except Exception:
+        for path in owned_paths:
+            path.unlink(missing_ok=True)
+        raise
+
+    return {
+        "queued": 1,
+        "queue_size": state.queue_size(model),
+        "task": {key: value for key, value in task.items() if not key.startswith("_")},
+    }
 
 
 def sanitize_prompt_meta(meta: dict | None) -> dict:
@@ -241,17 +402,7 @@ async def broadcast(item: dict) -> None:
 
 @app.get("/api/models")
 def models():
-    return [
-        {
-            "id": x.id,
-            "label": x.label,
-            "default_steps": x.default_steps,
-            "description": x.description,
-            "input_kind": x.input_kind,
-            "output_kind": x.output_kind,
-        }
-        for x in MODEL_SPECS.values()
-    ]
+    return [asdict(spec) for spec in MODEL_SPECS.values()]
 
 
 @app.get("/api/prompt/pipeline")
@@ -376,6 +527,55 @@ def add_batch(x: BatchIn, authorization: str | None = Header(None)):
     return {"queued": len(items), "queue_size": state.queue_size(model), "tasks": items}
 
 
+@app.post("/task/artifact/{model}", status_code=202)
+async def add_artifact_task(
+    model: str,
+    request: Request,
+    authorization: str | None = Header(None),
+):
+    auth(authorization)
+    model = artifact_model_or_400(model)
+    spec = MODEL_SPECS[model].artifact
+    assert spec is not None
+    form = await request.form()
+
+    file_value = form.get("file")
+    if file_value is not None and not hasattr(file_value, "read"):
+        raise HTTPException(status_code=400, detail="file must be an uploaded image")
+    file = file_value if file_value is not None else None
+    source_value = form.get("source_url", "")
+    if not isinstance(source_value, str):
+        raise HTTPException(status_code=400, detail="source_url must be text")
+
+    options_value = form.get("options", "{}")
+    if not isinstance(options_value, str):
+        raise HTTPException(status_code=400, detail="options must be JSON text")
+    try:
+        options = json.loads(options_value or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid options JSON: {exc.msg}")
+    if not isinstance(options, dict):
+        raise HTTPException(status_code=400, detail="options must be a JSON object")
+
+    auxiliary_uploads: dict[str, UploadFile | None] = {}
+    for item in spec.auxiliary_inputs:
+        value = form.get(item.id)
+        if value is not None and not hasattr(value, "read"):
+            raise HTTPException(status_code=400, detail=f"{item.id} must be an uploaded image")
+        auxiliary_uploads[item.id] = value if value is not None else None
+
+    return await enqueue_artifact_task(
+        model,
+        file=file,  # type: ignore[arg-type]
+        source_url=source_value,
+        options=options,
+        auxiliary_uploads=auxiliary_uploads,  # type: ignore[arg-type]
+    )
+
+
+# Legacy model-specific endpoints remain as compatibility aliases. The current
+# frontend uses /task/artifact/{model}; all validation/storage lives in the
+# shared enqueue_artifact_task path above.
 @app.post("/task/triposr", status_code=202)
 async def add_triposr_task(
     file: UploadFile | None = File(None),
@@ -388,67 +588,18 @@ async def add_triposr_task(
     authorization: str | None = Header(None),
 ):
     auth(authorization)
-    source_url = source_url.strip()
-    if (file is None) == (not source_url):
-        raise HTTPException(status_code=400, detail="Provide exactly one of file or source_url")
-    output_format = output_format.strip().lower()
-    if output_format not in {"glb", "obj"}:
-        raise HTTPException(status_code=400, detail="output_format must be glb or obj")
-    if not 128 <= mc_resolution <= 512:
-        raise HTTPException(status_code=400, detail="mc_resolution must be between 128 and 512")
-    if not 1024 <= chunk_size <= 131072:
-        raise HTTPException(status_code=400, detail="chunk_size must be between 1024 and 131072")
-    if not 0.5 <= foreground_ratio <= 1.0:
-        raise HTTPException(status_code=400, detail="foreground_ratio must be between 0.5 and 1.0")
-
-    task_id = state.next_id()
-    owned_input = False
-    if file is not None:
-        data = await file.read(INPUT_MAX_BYTES + 1)
-        if len(data) > INPUT_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="Input image is too large")
-        suffix = image_suffix(data)
-        if suffix is None:
-            raise HTTPException(status_code=400, detail="Input must be PNG, JPEG, or WebP")
-        input_dir = OUTPUT_DIR / "_inputs"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        input_path = input_dir / f"triposr_{int(time.time()*1000)}_{task_id:06d}{suffix}"
-        await asyncio.to_thread(input_path.write_bytes, data)
-        source_label = Path(file.filename or f"upload{suffix}").name
-        public_source_url = f"/outputs/_inputs/{input_path.name}"
-        owned_input = True
-    else:
-        input_path = local_output_path(source_url)
-        source_label = input_path.name
-        public_source_url = urlsplit(source_url).path
-
-    task = {
-        "id": task_id,
-        "model": "triposr",
-        "input_url": f"/task/input/{task_id}",
-        "source_url": public_source_url,
-        "source_label": source_label,
-        "output_format": output_format,
-        "mc_resolution": mc_resolution,
-        "chunk_size": chunk_size,
-        "foreground_ratio": foreground_ratio,
-        "remove_background": remove_background,
-        "created_at": time.time(),
-        "attempt": 0,
-        "_input_path": str(input_path.resolve()),
-        "_owned_input": owned_input,
-    }
-    try:
-        state.enqueue(task)
-    except queue.Full:
-        if owned_input:
-            input_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=503, detail="Task queue is full: triposr")
-    return {
-        "queued": 1,
-        "queue_size": state.queue_size("triposr"),
-        "task": {key: value for key, value in task.items() if not key.startswith("_")},
-    }
+    return await enqueue_artifact_task(
+        "triposr",
+        file=file,
+        source_url=source_url,
+        options={
+            "output_format": output_format.strip().lower(),
+            "mc_resolution": mc_resolution,
+            "chunk_size": chunk_size,
+            "foreground_ratio": foreground_ratio,
+            "remove_background": remove_background,
+        },
+    )
 
 
 @app.post("/task/hunyuan3d-2.1", status_code=202)
@@ -463,69 +614,19 @@ async def add_hunyuan3d21_task(
     authorization: str | None = Header(None),
 ):
     auth(authorization)
-    source_url = source_url.strip()
-    if (file is None) == (not source_url):
-        raise HTTPException(status_code=400, detail="Provide exactly one of file or source_url")
-    if not 1 <= shape_steps <= 50:
-        raise HTTPException(status_code=400, detail="shape_steps must be between 1 and 50")
-    if octree_resolution not in {128, 256, 384, 512}:
-        raise HTTPException(status_code=400, detail="octree_resolution must be one of 128, 256, 384, 512")
-    if not 1 <= paint_views <= 8:
-        raise HTTPException(status_code=400, detail="paint_views must be between 1 and 8")
-    if paint_resolution not in {128, 256, 384, 512}:
-        raise HTTPException(status_code=400, detail="paint_resolution must be one of 128, 256, 384, 512")
-    if texture_size not in {512, 1024, 2048, 4096}:
-        raise HTTPException(status_code=400, detail="texture_size must be one of 512, 1024, 2048, 4096")
-
-    task_id = state.next_id()
-    owned_input = False
-    if file is not None:
-        data = await file.read(INPUT_MAX_BYTES + 1)
-        if len(data) > INPUT_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="Input image is too large")
-        suffix = image_suffix(data)
-        if suffix is None:
-            raise HTTPException(status_code=400, detail="Input must be PNG, JPEG, or WebP")
-        input_dir = OUTPUT_DIR / "_inputs"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        input_path = input_dir / f"hunyuan3d21_{int(time.time()*1000)}_{task_id:06d}{suffix}"
-        await asyncio.to_thread(input_path.write_bytes, data)
-        source_label = Path(file.filename or f"upload{suffix}").name
-        public_source_url = f"/outputs/_inputs/{input_path.name}"
-        owned_input = True
-    else:
-        input_path = local_output_path(source_url)
-        source_label = input_path.name
-        public_source_url = urlsplit(source_url).path
-
-    task = {
-        "id": task_id,
-        "model": "hunyuan3d-2.1",
-        "input_url": f"/task/input/{task_id}",
-        "source_url": public_source_url,
-        "source_label": source_label,
-        "output_format": "glb",
-        "shape_steps": shape_steps,
-        "octree_resolution": octree_resolution,
-        "paint_views": paint_views,
-        "paint_resolution": paint_resolution,
-        "texture_size": texture_size,
-        "created_at": time.time(),
-        "attempt": 0,
-        "_input_path": str(input_path.resolve()),
-        "_owned_input": owned_input,
-    }
-    try:
-        state.enqueue(task)
-    except queue.Full:
-        if owned_input:
-            input_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=503, detail="Task queue is full: hunyuan3d-2.1")
-    return {
-        "queued": 1,
-        "queue_size": state.queue_size("hunyuan3d-2.1"),
-        "task": {key: value for key, value in task.items() if not key.startswith("_")},
-    }
+    return await enqueue_artifact_task(
+        "hunyuan3d-2.1",
+        file=file,
+        source_url=source_url,
+        options={
+            "shape_steps": shape_steps,
+            "octree_resolution": octree_resolution,
+            "paint_views": paint_views,
+            "paint_resolution": paint_resolution,
+            "texture_size": texture_size,
+            "output_format": "glb",
+        },
+    )
 
 
 @app.post("/task/fast-sam3d", status_code=202)
@@ -537,69 +638,13 @@ async def add_fast_sam3d_task(
     authorization: str | None = Header(None),
 ):
     auth(authorization)
-    source_url = source_url.strip()
-    if (file is None) == (not source_url):
-        raise HTTPException(status_code=400, detail="Provide exactly one of file or source_url")
-
-    mask_data = await mask.read(INPUT_MAX_BYTES + 1)
-    if len(mask_data) > INPUT_MAX_BYTES:
-        raise HTTPException(status_code=413, detail="Mask image is too large")
-    mask_suffix = image_suffix(mask_data)
-    if mask_suffix is None:
-        raise HTTPException(status_code=400, detail="Mask must be PNG, JPEG, or WebP")
-
-    task_id = state.next_id()
-    input_dir = OUTPUT_DIR / "_inputs"
-    input_dir.mkdir(parents=True, exist_ok=True)
-    owned_input = False
-    if file is not None:
-        data = await file.read(INPUT_MAX_BYTES + 1)
-        if len(data) > INPUT_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="Input image is too large")
-        suffix = image_suffix(data)
-        if suffix is None:
-            raise HTTPException(status_code=400, detail="Input must be PNG, JPEG, or WebP")
-        input_path = input_dir / f"fast_sam3d_{int(time.time()*1000)}_{task_id:06d}{suffix}"
-        await asyncio.to_thread(input_path.write_bytes, data)
-        source_label = Path(file.filename or f"upload{suffix}").name
-        public_source_url = f"/outputs/_inputs/{input_path.name}"
-        owned_input = True
-    else:
-        input_path = local_output_path(source_url)
-        source_label = input_path.name
-        public_source_url = urlsplit(source_url).path
-
-    mask_path = input_dir / f"fast_sam3d_mask_{int(time.time()*1000)}_{task_id:06d}{mask_suffix}"
-    await asyncio.to_thread(mask_path.write_bytes, mask_data)
-    task = {
-        "id": task_id,
-        "model": "fast-sam3d",
-        "input_url": f"/task/input/{task_id}",
-        "mask_url": f"/task/mask/{task_id}",
-        "source_url": public_source_url,
-        "source_label": source_label,
-        "mask_label": Path(mask.filename or f"mask{mask_suffix}").name,
-        "output_format": "glb",
-        "seed": seed,
-        "created_at": time.time(),
-        "attempt": 0,
-        "_input_path": str(input_path.resolve()),
-        "_mask_path": str(mask_path.resolve()),
-        "_owned_input": owned_input,
-        "_owned_mask": True,
-    }
-    try:
-        state.enqueue(task)
-    except queue.Full:
-        if owned_input:
-            input_path.unlink(missing_ok=True)
-        mask_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=503, detail="Task queue is full: fast-sam3d")
-    return {
-        "queued": 1,
-        "queue_size": state.queue_size("fast-sam3d"),
-        "task": {key: value for key, value in task.items() if not key.startswith("_")},
-    }
+    return await enqueue_artifact_task(
+        "fast-sam3d",
+        file=file,
+        source_url=source_url,
+        options={"seed": seed, "output_format": "glb"},
+        auxiliary_uploads={"mask": mask},
+    )
 
 
 @app.get("/task/next")
@@ -650,21 +695,32 @@ def task_input(task_id: int, authorization: str | None = Header(None)):
     return FileResponse(resolved, filename=task.get("source_label") or resolved.name)
 
 
-@app.get("/task/mask/{task_id}")
-def task_mask(task_id: int, authorization: str | None = Header(None)):
+@app.get("/task/aux/{task_id}/{name}")
+def task_aux_input(task_id: int, name: str, authorization: str | None = Header(None)):
     auth(authorization)
     task = state.lease_task(task_id)
-    if task is None or task.get("model") != "fast-sam3d":
-        raise HTTPException(status_code=404, detail="Fast-SAM3D task is not inflight")
-    path = Path(task.get("_mask_path", ""))
+    if task is None:
+        raise HTTPException(status_code=404, detail="Artifact task is not inflight")
+    model = str(task.get("model", ""))
+    spec = MODEL_SPECS.get(model)
+    allowed = {item.id for item in spec.artifact.auxiliary_inputs} if spec and spec.artifact else set()
+    if name not in allowed:
+        raise HTTPException(status_code=404, detail=f"Auxiliary input does not exist: {name}")
+    path = Path(task.get(f"_{name}_path", ""))
     root = OUTPUT_DIR.resolve()
     try:
         resolved = path.resolve(strict=True)
     except (FileNotFoundError, OSError):
-        raise HTTPException(status_code=404, detail="Mask image does not exist")
+        raise HTTPException(status_code=404, detail=f"Auxiliary input does not exist: {name}")
     if not resolved.is_relative_to(root) or not resolved.is_file():
-        raise HTTPException(status_code=404, detail="Mask image does not exist")
-    return FileResponse(resolved, filename=task.get("mask_label") or resolved.name)
+        raise HTTPException(status_code=404, detail=f"Auxiliary input does not exist: {name}")
+    return FileResponse(resolved, filename=task.get(f"{name}_label") or resolved.name)
+
+
+@app.get("/task/mask/{task_id}")
+def task_mask(task_id: int, authorization: str | None = Header(None)):
+    """Compatibility alias for older Fast-SAM3D workers."""
+    return task_aux_input(task_id, "mask", authorization)
 
 
 @app.post("/task/fail")
