@@ -108,6 +108,7 @@ cloudflared tunnel --url http://localhost:30100
 - `notebooks/001-sana-sprint-1.6b.ipynb`
 - `notebooks/002-z-image-turbo-gguf.ipynb`
 - `notebooks/003-triposr-image-to-3d.ipynb`
+- `notebooks/011-v2-alpha-ben2-isnet-birefnet.ipynb` — **Florence + SAM2.1** 方案。
 
 所有 Notebook 都会：
 
